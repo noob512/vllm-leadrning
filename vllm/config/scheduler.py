@@ -165,25 +165,45 @@ class SchedulerConfig:
         return SchedulerConfig(**kwargs)
 
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
+        """
+        获取将被用于实例化引擎的调度器类 (Scheduler Class)。
+        返回值是一个“类”（而不是对象实例），引擎稍后会拿着这个类去创建真正的调度器。
+        """
+
+        # ---------------------------------------------------------
+        # 1. 默认分支：使用 vLLM 官方提供的调度器
+        # ---------------------------------------------------------
         if self.scheduler_cls is None:
+            
+            # 场景 1A：开启了异步调度 (Async Scheduling)
             if self.async_scheduling:
+                # 局部/延迟导入：防止循环依赖，且只在需要时才加载相关模块
                 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-
                 return AsyncScheduler
+            
+            # 场景 1B：使用标准的同步调度器
             from vllm.v1.core.sched.scheduler import Scheduler
-
             return Scheduler
 
-        # This warning can be removed once the Scheduler interface is
-        # finalized and we can maintain support for scheduler classes that
-        # implement it
+        # ---------------------------------------------------------
+        # 2. 自定义分支：用户强行指定了第三方的调度器
+        # ---------------------------------------------------------
+        # vLLM V1 架构的接口还在剧烈演进中。如果你自己写了一个调度器插进来，
+        # 官方在这里给你打个预防针：下个版本接口变了别怪我。
         logger.warning_once(
-            "Using custom scheduler class %s. This scheduler interface is "
-            "not public and compatibility may not be maintained.",
+            "正在使用自定义调度器类 %s。此调度器接口当前"
+            "并非公共稳定 API，可能无法保证向后兼容性。",
             self.scheduler_cls,  # type: ignore[arg-type]
         )
+        
+        # 场景 2A：直接传进来的是一个 Python 类对象 (class)
         if not isinstance(self.scheduler_cls, str):
+            # cast 只是给静态类型检查工具 (mypy) 看的，运行时无副作用
             return cast(type["SchedulerInterface"], self.scheduler_cls)
+            
+        # 场景 2B：传进来的是一个字符串（类路径，例如 "my_package.MyScheduler"）
+        # 这通常发生在通过 JSON 配置文件或命令行参数启动 vLLM 时。
+        # resolve_obj_by_qualname 会通过反射机制动态把这个字符串解析成真正的 Python 类。
         return resolve_obj_by_qualname(self.scheduler_cls)
 
     def compute_hash(self) -> str:

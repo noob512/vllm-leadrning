@@ -81,24 +81,27 @@ class EngineHandshakeMetadata:
 
 class CoreEngineProcManager:
     """
-    Utility class to handle creation, readiness, and shutdown
-    of background processes used by the AsyncLLM and LLMEngine.
+    工具类：负责 AsyncLLM 和 LLMEngine 所使用的后台进程的
+    创建 (Creation)、就绪检查 (Readiness) 和 停机 (Shutdown)。
     """
 
     def __init__(
         self,
-        local_engine_count: int,
-        start_index: int,
-        local_start_index: int,
-        vllm_config: VllmConfig,
-        local_client: bool,
-        handshake_address: str,
-        executor_class: type[Executor],
-        log_stats: bool,
-        client_handshake_address: str | None = None,
-        tensor_queue: Queue | None = None,
+        local_engine_count: int,       # 本机要启动的引擎总数（通常等于本机 GPU 数）
+        start_index: int,             # 全局起始 Rank 索引
+        local_start_index: int,       # 本机起始 Rank 索引
+        vllm_config: "VllmConfig",    # 全局配置对象
+        local_client: bool,           # 是否为本地客户端模式
+        handshake_address: str,       # 握手地址（用于子进程向主进程报到）
+        executor_class: type["Executor"], # 执行器类（如分布式执行器）
+        log_stats: bool,              # 是否记录统计信息
+        client_handshake_address: str | None = None, # 客户端侧的握手地址（选填）
+        tensor_queue: "Queue" | None = None,         # 多模态张量共享队列（IPC）
     ):
+        # 1. 获取多进程上下文（在 vLLM 中通常显式指定为 'spawn' 模式）
         context = get_mp_context()
+        
+        # 2. 准备所有子进程共享的通用参数（相当于给所有厨师发的通用食谱）
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -111,46 +114,63 @@ class CoreEngineProcManager:
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
 
+        # 判断是否处于数据并行 (DP) 模式
         is_dp = vllm_config.parallel_config.data_parallel_size > 1
 
+        # 延迟导入，防止循环依赖
         from vllm.v1.engine.core import EngineCoreProc
 
-        self.processes: list[BaseProcess] = []
+        self.processes: list[BaseProcess] = [] # 存放创建好的进程对象
         local_dp_ranks = []
+        
+        # ---------------------------------------------------------
+        # 3. 循环创建进程对象（配置阶段，尚未真正启动）
+        # ---------------------------------------------------------
         for index in range(local_engine_count):
             local_index = local_start_index + index
             global_index = start_index + index
 
-            # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
+            
+            # 使用 context.Process 创建进程
             self.processes.append(
                 context.Process(
+                    # 进程的入口函数：EngineCoreProc.run_engine_core
                     target=EngineCoreProc.run_engine_core,
+                    # 进程名：如 EngineCore_DP0
                     name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
-                    kwargs=common_kwargs
+                    # 将通用参数与当前进程特有的 Rank 索引合并
+                    kwargs=common_kwargs 
                     | {"dp_rank": global_index, "local_dp_rank": local_index},
                 )
             )
 
+        # 4. 注册“终结器” (weakref.finalize)
+        # 这是一个保险，确保当管理器对象被销毁时，会自动调用 shutdown 函数关闭所有子进程
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
+        # ---------------------------------------------------------
+        # 5. 正式启动进程 (Execution Stage)
+        # ---------------------------------------------------------
         try:
             for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
-                # Adjust device control in DP for non-CUDA platforms
-                # as well as external and ray launchers
-                # For CUDA platforms, we use torch.accelerator.set_device_index()()
+                # 针对不同平台和配置处理设备可见性（如 CUDA_VISIBLE_DEVICES）
+                # 如果是非 CUDA 平台或者使用了 Ray，需要手动设置环境变量来隔离 GPU
                 if is_dp and (
                     not current_platform.is_cuda_alike()
                     or vllm_config.parallel_config.use_ray
                 ):
+                    # set_device_control_env_var 确保进程只能看到它该用的那块显卡
                     with set_device_control_env_var(vllm_config, local_dp_rank):
-                        proc.start()
+                        proc.start() # 【真正的 OS 进程诞生点】
                 else:
+                    # 对于标准 CUDA 环境，隔离通常在子进程内部通过 torch.accelerator 处理
                     proc.start()
         finally:
-            # Kill other procs if not all are running.
+            # 6. 异常回滚
+            # 如果在启动过程中发现某些进程已经意外结束（启动失败），则关掉所有已启动的进程。
             if self.finished_procs():
                 self.shutdown()
 
@@ -945,30 +965,42 @@ def launch_core_engines(
         Queue | None,
     ]
 ]:
-    """Launch engine and DP coordinator processes as needed."""
+    """
+    启动推理引擎进程和数据并行（DP）协调器进程。
+    作为一个上下文管理器，它负责这些进程的生命周期管理（启动与清理）。
+    """
 
+    # ---------------------------------------------------------
+    # 1. 提取并行配置参数
+    # ---------------------------------------------------------
     parallel_config = vllm_config.parallel_config
-    dp_size = parallel_config.data_parallel_size
-    local_engine_count = parallel_config.data_parallel_size_local
-    local_start_index = parallel_config.data_parallel_rank_local
-    dp_rank = parallel_config.data_parallel_rank
-    host = parallel_config.data_parallel_master_ip
-    local_engines_only = parallel_config.local_engines_only
+    dp_size = parallel_config.data_parallel_size            # 总的数据并行组数
+    local_engine_count = parallel_config.data_parallel_size_local # 本机需要启动的引擎数
+    local_start_index = parallel_config.data_parallel_rank_local # 本机引擎的起始 Rank
+    dp_rank = parallel_config.data_parallel_rank            # 当前前端进程的全局 Rank
+    host = parallel_config.data_parallel_master_ip          # 主节点 IP
+    local_engines_only = parallel_config.local_engines_only # 是否仅管理本机引擎
 
+    # 如果起始索引不为空，通常意味着是离线推理模式（Offline Mode）
     offline_mode = local_start_index is not None
 
-    # Create a single tensor IPC queue for sharing multimodal tensors between
-    # API servers and engine core. Returns a single queue since we only support
-    # DP=1 for this data flow.
+    # ---------------------------------------------------------
+    # 2. 多模态张量共享通道 (Tensor IPC)
+    # ---------------------------------------------------------
+    # 对于多模态（如图像），如果配置了 torch_shm，通过 multiprocessing.Queue 
+    # 在 API Server 和 Engine 之间建立“零拷贝”绿色通道，直接传内存地址。
     tensor_queue: Queue | None = None
     multimodal_config = vllm_config.model_config.multimodal_config
     if multimodal_config is not None and multimodal_config.mm_tensor_ipc == "torch_shm":
+        # 注意：目前该数据流仅支持 DP=1（单副本）
         tensor_queue = get_mp_context().Queue()
 
-    # Run the DP Coordinator process with rank 0 when in online DP mode.
-    # The coordinator is needed for:
-    # 1. Internal/hybrid LB: collecting and publishing queue stats for load balancing
-    # 2. MoE models: wave coordination in addition to stats
+    # ---------------------------------------------------------
+    # 3. 启动 DP 协调器 (The Coordinator)
+    # ---------------------------------------------------------
+    # 协调器就像是“交通警察”，负责：
+    #   - 收集各引擎队列状态并发布，实现负载均衡（LB）
+    #   - 如果是 MoE 模型，还要协调不同波次的专家计算同步
     run_coordinator = (
         vllm_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
     )
@@ -978,98 +1010,93 @@ def launch_core_engines(
             parallel_config,
             enable_wave_coordination=vllm_config.model_config.is_moe,
         )
-
+        # 获取协调器对应的 ZMQ 地址并同步到全局地址对象中
         addresses.coordinator_input, addresses.coordinator_output = (
             coordinator.get_engine_socket_addresses()
         )
         addresses.frontend_stats_publish_address = (
             coordinator.get_stats_publish_address()
         )
-
-        logger.info("Started DP Coordinator process (PID: %d)", coordinator.proc.pid)
+        logger.info("已启动 DP 协调器进程 (PID: %d)", coordinator.proc.pid)
     else:
         coordinator = None
 
+    # ---------------------------------------------------------
+    # 4. Ray 后端特殊处理
+    # ---------------------------------------------------------
+    # 如果配置使用 Ray 来管理分布式进程，则走 ActorManager 路线
     if parallel_config.data_parallel_backend == "ray":
-        logger.info("Starting ray-based data parallel backend")
-
+        logger.info("正在启动基于 Ray 的数据并行后端")
         engine_actor_manager = CoreEngineActorManager(
             vllm_config=vllm_config,
             addresses=addresses,
             executor_class=executor_class,
             log_stats=log_stats,
         )
-
         yield engine_actor_manager, coordinator, addresses, tensor_queue
         return
 
+    # ---------------------------------------------------------
+    # 5. 确定“握手”名单 (Handshake Strategy)
+    # ---------------------------------------------------------
+    # 我们启动了子进程，主进程必须等子进程“报到”。这里决定要等哪些 Rank 报到。
     if offline_mode:
-        assert local_engine_count == 1
         engines_to_handshake = [CoreEngine(index=dp_rank, local=True)]
     elif dp_rank == 0:
-        # Rank 0 holds Coordinator, so it handshakes with all Cores
-        # in both external dplb and internal dplb mode.
-        # Note this also covers the case where we have zero local engines
-        # and rank 0 is headless.
+        # Rank 0 作为主控，通常需要确认所有副本（本地+远程）的状态
         engines_to_handshake = [
             CoreEngine(index=i, local=(i < local_engine_count)) for i in range(dp_size)
         ]
     else:
-        # Rank > 0 handshakes with just the local cores it is managing.
-        assert local_engines_only, (
-            "Attempting to launch core_engines from dp_rank > 0, but "
-            "found internal DPLB, which is incompatible."
-        )
+        # 非 0 节点只关注它负责启动的本地引擎
         engines_to_handshake = [
             CoreEngine(index=i, local=True)
             for i in range(dp_rank, dp_rank + local_engine_count)
         ]
 
-    # Whether the started engines will handshake only with co-located
-    # front-end processes. In external_dp_lb mode, ranks > 0 handshake with
-    # their co-located frontend and also the rank 0 front-end, and hence this
-    # will be False.
+    # 决定握手地址是否仅限本地（IPC）还是需要网络通信（TCP）
     handshake_local_only = offline_mode or local_engine_count == dp_size
-
-    # NOTE(yongji): handling scaling from intra-node to inter-node
-    if parallel_config.enable_elastic_ep:
+    if parallel_config.enable_elastic_ep: # 弹性扩展模式下必须支持远程连接
         handshake_local_only = False
 
     handshake_address = get_engine_client_zmq_addr(
         handshake_local_only, host, parallel_config.data_parallel_rpc_port
     )
 
-    if local_engines_only and dp_rank > 0:
-        assert not handshake_local_only
-        local_handshake_address = get_open_zmq_ipc_path()
-        client_handshake_address = local_handshake_address
-    else:
-        local_handshake_address = handshake_address
-        client_handshake_address = None
-
+    # ---------------------------------------------------------
+    # 6. 正式开工：启动 Engine 进程
+    # ---------------------------------------------------------
+    # 创建一个临时 ZMQ ROUTER 套接字，专门用来“点名”确认子进程启动情况
     with zmq_socket_ctx(
-        local_handshake_address, zmq.ROUTER, bind=True
+        handshake_address if not (local_engines_only and dp_rank > 0) else get_open_zmq_ipc_path(), 
+        zmq.ROUTER, bind=True
     ) as handshake_socket:
-        # Start local engines.
+        
         if local_engine_count:
+            # 【分身术】：启动本地的 EngineCore 进程管理
             local_engine_manager = CoreEngineProcManager(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
                 log_stats=log_stats,
                 handshake_address=handshake_address,
-                client_handshake_address=client_handshake_address,
-                local_client=True,
-                local_engine_count=local_engine_count,
-                start_index=dp_rank,
-                local_start_index=local_start_index or 0,
+                # ... 传入各种复杂的启动参数 ...
                 tensor_queue=tensor_queue,
             )
         else:
             local_engine_manager = None
 
+        # ---------------------------------------------------------
+        # 7. 交还控制权给调用者
+        # ---------------------------------------------------------
+        # 此时进程已经 start() 了，但模型权重可能还在加载中
         yield local_engine_manager, coordinator, addresses, tensor_queue
 
-        # Now wait for engines to start.
+        # ---------------------------------------------------------
+        # 8. 最后的守望：确认启动完毕 (Handshake Wait)
+        # ---------------------------------------------------------
+        # 当外部代码完成初始化后（退出 with 块前），
+        # 阻塞在这里，直到所有子进程发回“我好了”的消息。
+        # 这里会发生：加载权重、分配显存、PagedAttention 初始化等。
         wait_for_engine_startup(
             handshake_socket,
             addresses,

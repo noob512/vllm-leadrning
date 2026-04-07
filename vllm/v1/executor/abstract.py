@@ -34,51 +34,86 @@ _R = TypeVar("_R")
 FailureCallback = Callable[[], None]
 
 
-class Executor(ABC):
-    """Abstract base class for vLLM executors."
+from abc import ABC
 
-    An executor is responsible for executing the model on one device,
-    or it can be a distributed executor that can execute the model on multiple devices.
+class Executor(ABC):
+    """
+    vLLM 执行器的抽象基类 (Abstract Base Class)。
+
+    执行器 (Executor) 的职责是：
+    在一个设备（单卡）上执行模型前向传播，或者作为一个分布式执行器，协调多个设备（多卡/多机）共同完成计算。
     """
 
-    uses_ray: bool = False  # whether the executor uses Ray for orchestration.
-    supports_pp: bool = False  # whether the executor supports PP
+    # 两个核心能力标识，子类可以覆盖这些值
+    uses_ray: bool = False  # 该执行器是否使用 Ray 框架来进行分布式进程编排
+    supports_pp: bool = False  # 该执行器是否支持流水线并行 (Pipeline Parallelism)
 
     @staticmethod
     def get_class(vllm_config: VllmConfig) -> type["Executor"]:
+        """
+        工厂方法：根据全局配置，返回对应的 Executor [类]（注意：返回的是类，不是实例）。
+        """
         executor_class: type[Executor]
         parallel_config = vllm_config.parallel_config
+        
+        # 提取用户配置的分布式执行器后端（比如 "mp", "ray", "uni"）
         distributed_executor_backend = parallel_config.distributed_executor_backend
-        # distributed_executor_backend must be set in VllmConfig.__post_init__
+        
+        # distributed_executor_backend 必须在 VllmConfig.__post_init__ 中被提前设置好
+
+        # ---------------------------------------------------------
+        # 分支 1：用户直接传入了一个具体的 Python 类对象
+        # ---------------------------------------------------------
         if isinstance(distributed_executor_backend, type):
+            # 校验：你传进来的类必须是 Executor 的子类
             if not issubclass(distributed_executor_backend, Executor):
                 raise TypeError(
                     "distributed_executor_backend must be a subclass of "
                     f"Executor. Got {distributed_executor_backend}."
                 )
             executor_class = distributed_executor_backend
+            
+        # ---------------------------------------------------------
+        # 分支 2：使用 Ray 进行跨机器/大规模分布式编排
+        # ---------------------------------------------------------
         elif distributed_executor_backend == "ray":
+            # 根据环境变量决定是使用 V2 版本还是老版本的 Ray Executor
             if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
                 from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
-
                 executor_class = RayExecutorV2
             else:
                 from vllm.v1.executor.ray_executor import RayDistributedExecutor
-
                 executor_class = RayDistributedExecutor
+                
+        # ---------------------------------------------------------
+        # 分支 3：使用原生 Multiprocessing 进行单机多卡编排
+        # ---------------------------------------------------------
         elif distributed_executor_backend == "mp":
+            # 这是最常见的单机多卡（张量并行 TP）模式
             from vllm.v1.executor.multiproc_executor import MultiprocExecutor
-
             executor_class = MultiprocExecutor
+            
+        # ---------------------------------------------------------
+        # 分支 4：单卡单进程模式 (Uni-processing)
+        # ---------------------------------------------------------
         elif distributed_executor_backend == "uni":
+            # 单卡推理，没有进程间通信开销，最轻量级
             from vllm.v1.executor.uniproc_executor import UniProcExecutor
-
             executor_class = UniProcExecutor
+            
+        # ---------------------------------------------------------
+        # 分支 5：外部启动器模式 (如 torchrun, MPI)
+        # ---------------------------------------------------------
         elif distributed_executor_backend == "external_launcher":
-            # TODO: make v1 scheduling deterministic
-            # to support external launcher
+            # 当你不用 vLLM 自己的进程管理，而是用外部工具拉起分布式集群时使用
+            # TODO: 目前 V1 架构的调度还需要做确定性优化以完美支持外部启动器
             executor_class = ExecutorWithExternalLauncher
+            
+        # ---------------------------------------------------------
+        # 分支 6：用户通过字符串传入了自定义类的包路径
+        # ---------------------------------------------------------
         elif isinstance(distributed_executor_backend, str):
+            # 动态反射：根据字符串（如 "my_custom_vllm.MyExecutor"）加载并解析出真实的 Python 类
             executor_class = resolve_obj_by_qualname(distributed_executor_backend)
             if not issubclass(executor_class, Executor):
                 raise TypeError(
@@ -86,9 +121,11 @@ class Executor(ABC):
                     f"Executor. Got {executor_class}."
                 )
         else:
+            # 未知后端的兜底报错
             raise ValueError(
                 f"Unknown distributed executor backend: {distributed_executor_backend}"
             )
+            
         return executor_class
 
     @instrument(span_name="Executor init")

@@ -103,6 +103,12 @@ class AsyncIntermediateTensors(IntermediateTensors):
 
 
 class Worker(WorkerBase):
+    """
+    vLLM 官方默认的 Worker 实现。
+    它继承自 WorkerBase，主要负责 GPU 设备的管理、张量运算精度的设置以及各种高级硬件特性的初始化。
+    在不指定特殊硬件（如 TPU/Neuron）的情况下，系统默认拉起的就是这个 Worker。
+    """
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -111,6 +117,10 @@ class Worker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        # ---------------------------------------------------------
+        # 1. 继承并初始化基类配置 (WorkerBase)
+        # ---------------------------------------------------------
+        # 调用父类构造函数，将所有的 config 配置文件“解压缩”绑定到 self 身上。
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -119,18 +129,37 @@ class Worker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
-        # configure float32 matmul precision according to vLLM env.
+        # ---------------------------------------------------------
+        # 2. PyTorch 矩阵乘法精度优化 (Float32 Matmul Precision)
+        # ---------------------------------------------------------
+        # 大模型中哪怕是浮点运算的尾数差异也会影响性能。
+        # 现代 NVIDIA GPU (如 Ampere 架构以后的 Tensor Cores) 允许使用 TF32 来加速 FP32 矩阵乘法。
+        # 这里从环境变量获取设置（通常为 'high' 或 'highest'），然后告诉 PyTorch 应该使用多高的精度来计算。
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
 
+        # ---------------------------------------------------------
+        # 3. 弹性专家并行 (Elastic EP) 缩放支持
+        # ---------------------------------------------------------
+        # 这是一个针对混合专家模型 (MoE，如 Mixtral/DeepSeek) 的前沿特性。
+        # 当处理 MoE 模型时，它允许集群在运行中动态地增加或减少用来计算不同“专家”的 GPU 节点。
         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
-
         self.elastic_ep_executor = ElasticEPScalingExecutor(self)
 
-        # Buffers saved before sleep
+        # ---------------------------------------------------------
+        # 4. 睡眠模式缓存 (Sleep State Buffers)
+        # ---------------------------------------------------------
+        # 用于在资源受限的环境下（比如后台闲置的大模型服务），
+        # 当模型进入“睡眠”状态时，把一些关键的张量 (Tensor) 保存起来，避免被回收。
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
 
-        # Weight transfer engine (initialized on-demand)
+        # ---------------------------------------------------------
+        # 5. 模型权重传输引擎 (Weight Transfer Engine)
+        # ---------------------------------------------------------
+        # 这是一个用于高可用/快速弹性部署的设计。
+        # 当启动新的 Worker 时，如果不走磁盘加载，而是直接通过网络（如 RDMA/NCCL）
+        # 把权重张量从现有的 Worker 拷贝过来，启动速度会提升数倍。
+        # 这是一个懒加载机制，只在配置开启时才初始化引擎。
         self.weight_transfer_engine = (
             WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
@@ -140,18 +169,27 @@ class Worker(WorkerBase):
             else None
         )
 
-        # Torch/CUDA profiler. Enabled and configured through profiler_config.
-        # Profiler wrapper is created lazily in profile() when start is called,
-        # so we have all the information needed for proper trace naming.
+        # ---------------------------------------------------------
+        # 6. PyTorch/CUDA 性能分析器 (Profiler) 配置
+        # ---------------------------------------------------------
+        # Profiler 用于追踪每一行代码、每一个 CUDA 算子到底耗时多少（分析性能瓶颈）。
         self.profiler: Any | None = None
         self.profiler_config = vllm_config.profiler_config
 
-        # Only validate profiler config is valid, don't instantiate yet
+        # 安全检查：只允许 "torch" (PyTorch自带)、"cuda" (NVIDIA Nsight) 或者 None。
+        # 注意：这里只是验证配置合法，真正的实例化会在调用 profile() 时懒加载（因为开销很大）。
         if self.profiler_config.profiler not in ("torch", "cuda", None):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
+        # ---------------------------------------------------------
+        # 7. V2 架构升级标记与流水线并行状态
+        # ---------------------------------------------------------
+        # vLLM 正在经历底层 ModelRunner (模型执行器) 从 V1 到 V2 的架构大升级。
+        # 这个环境变量标志决定了稍后它会实例化新版还是旧版的核心算子引擎。
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
-        # pending non-blocking PP send work from the previous iteration
+        
+        # 针对流水线并行 (Pipeline Parallelism, PP) 的优化。
+        # 记录上一轮迭代中还未完成的“发送 (Send)”任务句柄，用于实现通信与计算的重叠 (Overlap)。
         self._pp_send_work: list[Handle] = []
 
     def sleep(self, level: int = 1) -> None:
@@ -744,53 +782,77 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    # 强制禁用 PyTorch 的梯度计算引擎。
+    # 在 LLM 推理场景下，这能显著降低显存占用并提升前向传播速度。
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
+        
+        # ---------------------------------------------------------
+        # 1. 扫尾工作：确保上一轮的流水线发送 (PP Send) 已完成
+        # ---------------------------------------------------------
+        # 在流水线并行中，当前节点计算完后会“异步”把结果发给下一个节点。
+        # 这里必须 wait() 确保上一轮的数据已经彻底发完，
+        # 否则当前轮次的新计算可能会覆盖底层的通信 buffer，导致数据损坏。
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
+        # 检查这轮是否真的有 Token 需要算（还是单纯的空转调度）
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
 
+        # ---------------------------------------------------------
+        # 2. 序列并行 (Sequence Parallelism, SP) 与 PP 的融合预处理
+        # ---------------------------------------------------------
+        # 如果同时开启了流水线并行 (PP > 1) 和序列并行 (SP)，情况会非常复杂。
+        # 因为 SP 会把长序列切碎分散在多个 GPU 上。在跨流水线节点传输前，
+        # 我们需要决定是否要先把这些碎片 All-Gather 拼起来。
         if (
             parallel_config.pipeline_parallel_size > 1
             and compilation_config.pass_config.enable_sp
             and forward_pass
         ):
-            # currently only supported by V1 GPUModelRunner
+            # 目前只有 V1 架构的 GPUModelRunner 完美支持这种复杂的 SP+PP 混合逻辑
             assert not self.use_v2_model_runner
+            
+            # 提取本批次每个请求被调度的 Token 数量
             num_scheduled_tokens_np = np.array(
                 list(scheduler_output.num_scheduled_tokens.values()),
                 dtype=np.int32,
             )
-            # TODO(lucas): This is pretty gross; ideally we should only ever call
-            # `_determine_batch_execution_and_padding` once (will get called again
-            # in `execute_model`) but this requires a larger refactor of PP.
+            
+            # TODO: 这是一个技术债。这里提前调用 _determine_batch_execution_and_padding
+            # 是为了算出当前 batch 的结构 (batch_desc)，从而判断底层张量是否是 scattered（分散的）。
             _, batch_desc, _, _, _ = (
                 self.model_runner._determine_batch_execution_and_padding(
                     num_tokens=num_scheduled_tokens,
                     num_reqs=len(num_scheduled_tokens_np),
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
-                    use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+                    use_cascade_attn=False,
                 )
             )
+            # 确定哪些张量需要在接收/发送时进行 All-Gather
             all_gather_tensors = {
                 "residual": not is_residual_scattered_for_sp(
                     self.vllm_config, batch_desc.num_tokens
                 )
             }
 
+        # ---------------------------------------------------------
+        # 3. 流水线接收 (Pipeline Receive): 承接上游数据
+        # ---------------------------------------------------------
+        # 如果当前节点不是流水线的第一级 (not is_first_rank)，它不能凭空算出结果，
+        # 它必须先接收上一个 GPU 节点传过来的隐藏层状态 (Hidden States)。
         if forward_pass and not get_pp_group().is_first_rank:
+            # 发起异步接收 (irecv)。使用异步是为了尽早发起网络请求，隐藏通信延迟。
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
@@ -798,41 +860,63 @@ class Worker(WorkerBase):
                 )
             )
             assert tensor_dict is not None
+            # 将收到的原始 Tensor 包装成 AsyncIntermediateTensors，
+            # 底层的 ModelRunner 在真正需要用这个张量之前，会自动调用 wait()。
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
 
+        # ---------------------------------------------------------
+        # 4. 核心计算：驱动 Model Runner (The Core Engine)
+        # ---------------------------------------------------------
+        # 把图纸 (scheduler_output) 和上游传来的半成品 (intermediate_tensors)
+        # 一起扔给底层的算子引擎。这里才是真正调用 FlashAttention 等 CUDA 算子的地方。
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            
+            # 针对 V2 架构 + Pooling 模型 (如 Embedding/Reward 模型) 的特殊逻辑
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
                 and output is None
             ):
                 output = self.model_runner.pool()  # type: ignore
+                
+            # 如果输出的是最终的 Token 或 Logits (说明这是流水线的最后一级)，
+            # 直接将结果层层返回给最外层的主进程。
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
                 return output
 
+        # ---------------------------------------------------------
+        # 5. 流水线发送 (Pipeline Send): 传递给下游
+        # ---------------------------------------------------------
+        # 如果代码走到了这里，说明当前节点是流水线的“中间节点”。
+        # output 的类型必定是 IntermediateTensors（即中间层的 Hidden States）。
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
+        
+        # 确保中间节点不是最后一个 rank (否则它应该返回最终的 Token)，并且未使用外部启动器。
         assert (
             parallel_config.distributed_executor_backend != "external_launcher"
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
+        # 发起非阻塞发送 (isend)。
+        # 把当前 GPU 算出来的中间层状态，通过 NCCL/P2P 发给流水线里的下一个 GPU。
+        # 句柄 (Handle) 保存在 self._pp_send_work 中，供下一轮 step 开始时检查。
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
 
+        # 中间节点不需要向主进程返回具体的 Token 结果，所以返回 None。
         return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

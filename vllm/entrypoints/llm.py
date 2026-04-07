@@ -103,109 +103,83 @@ _R = TypeVar("_R", default=Any)
 
 
 class LLM:
-    """An LLM for generating texts from given prompts and sampling parameters.
+    """一个用于根据给定提示（prompts）和采样参数生成文本的大语言模型（LLM）。
 
-    This class includes a tokenizer, a language model (possibly distributed
-    across multiple GPUs), and GPU memory space allocated for intermediate
-    states (aka KV cache). Given a batch of prompts and sampling parameters,
-    this class generates texts from the model, using an intelligent batching
-    mechanism and efficient memory management.
+    该类包含一个分词器（tokenizer）、一个语言模型（可能分布在多个 GPU 上），
+    以及为中间状态（即 KV 缓存）分配的 GPU 内存空间。给定一批提示和采样参数，
+    该类利用智能批处理机制和高效的内存管理，从模型中生成文本。
 
-    Args:
-        model: The name or path of a HuggingFace Transformers model.
-        tokenizer: The name or path of a HuggingFace Transformers tokenizer.
-        tokenizer_mode: The tokenizer mode. "auto" will use the fast tokenizer
-            if available, and "slow" will always use the slow tokenizer.
-        skip_tokenizer_init: If true, skip initialization of tokenizer and
-            detokenizer. Expect valid prompt_token_ids and None for prompt
-            from the input.
-        trust_remote_code: Trust remote code (e.g., from HuggingFace) when
-            downloading the model and tokenizer.
-        allowed_local_media_path: Allowing API requests to read local images
-            or videos from directories specified by the server file system.
-            This is a security risk. Should only be enabled in trusted
-            environments.
-        allowed_media_domains: If set, only media URLs that belong to this
-            domain can be used for multi-modal inputs.
-        tensor_parallel_size: The number of GPUs to use for distributed
-            execution with tensor parallelism.
-        dtype: The data type for the model weights and activations. Currently,
-            we support `float32`, `float16`, and `bfloat16`. If `auto`, we use
-            the `dtype` attribute of the Transformers model's config. However,
-            if the `dtype` in the config is `float32`, we will use `float16` instead.
-        quantization: The method used to quantize the model weights. Currently,
-            we support "awq", "gptq", and "fp8" (experimental).
-            If None, we first check the `quantization_config` attribute in the
-            model config file. If that is None, we assume the model weights are
-            not quantized and use `dtype` to determine the data type of
-            the weights.
-        revision: The specific model version to use. It can be a branch name,
-            a tag name, or a commit id.
-        tokenizer_revision: The specific tokenizer version to use. It can be a
-            branch name, a tag name, or a commit id.
-        chat_template: The chat template to apply.
-        seed: The seed to initialize the random number generator for sampling.
-        gpu_memory_utilization: The ratio (between 0 and 1) of GPU memory to
-            reserve for the model weights, activations, and KV cache. Higher
-            values will increase the KV cache size and thus improve the model's
-            throughput. However, if the value is too high, it may cause out-of-
-            memory (OOM) errors.
-        kv_cache_memory_bytes: Size of KV Cache per GPU in bytes. By default,
-            this is set to None and vllm can automatically infer the kv cache
-            size based on gpu_memory_utilization. However, users may want to
-            manually specify the kv cache memory size. kv_cache_memory_bytes
-            allows more fine-grain control of how much memory gets used when
-            compared with using gpu_memory_utilization. Note that
-            kv_cache_memory_bytes (when not-None) ignores
-            gpu_memory_utilization
-        cpu_offload_gb: The size (GiB) of CPU memory to use for offloading
-            the model weights. This virtually increases the GPU memory space
-            you can use to hold the model weights, at the cost of CPU-GPU data
-            transfer for every forward pass.
-        offload_group_size: Prefetch offloading: Group every N layers
-            together. Offload last `offload_num_in_group` layers of each group.
-            Default is 0 (disabled).
-        offload_num_in_group: Prefetch offloading: Number of layers to
-            offload per group. Default is 1.
-        offload_prefetch_step: Prefetch offloading: Number of layers to
-            prefetch ahead. Higher values hide more latency but use more GPU
-            memory. Default is 1.
-        offload_params: Prefetch offloading: Set of parameter name segments
-            to selectively offload. Only parameters whose names contain one of
-            these segments will be offloaded (e.g., {"gate_up_proj", "down_proj"}
-            for MLP weights, or {"w13_weight", "w2_weight"} for MoE expert
-            weights). If None or empty, all parameters are offloaded.
-        enforce_eager: Whether to enforce eager execution. If True, we will
-            disable CUDA graph and always execute the model in eager mode.
-            If False, we will use CUDA graph and eager execution in hybrid.
-        enable_return_routed_experts: Whether to return routed experts.
-        disable_custom_all_reduce: See
-            [ParallelConfig][vllm.config.ParallelConfig].
-        hf_token: The token to use as HTTP bearer authorization for remote files
-            . If `True`, will use the token generated when running
-            `hf auth login` (stored in `~/.cache/huggingface/token`).
-        hf_overrides: If a dictionary, contains arguments to be forwarded to the
-            HuggingFace config. If a callable, it is called to update the
-            HuggingFace config.
-        mm_processor_kwargs: Arguments to be forwarded to the model's processor
-            for multi-modal data, e.g., image processor. Overrides for the
-            multi-modal processor obtained from `AutoProcessor.from_pretrained`.
-            The available overrides depend on the model that is being run.
-            For example, for Phi-3-Vision: `{"num_crops": 4}`.
-        pooler_config: Initialize non-default pooling config for the pooling model,
-            e.g., `PoolerConfig(seq_pooling_type="MEAN", use_activation=False)`.
-        compilation_config: Either an integer or a dictionary. If it is an
-            integer, it is used as the mode of compilation optimization. If it
-            is a dictionary, it can specify the full compilation configuration.
-        attention_config: Configuration for attention mechanisms. Can be a
-            dictionary or an AttentionConfig instance. If a dictionary, it will
-            be converted to an AttentionConfig. Allows specifying the attention
-            backend and other attention-related settings.
-        **kwargs: Arguments for [`EngineArgs`][vllm.EngineArgs].
+    参数：
+        model: HuggingFace Transformers 模型的名称或路径。
+        tokenizer: HuggingFace Transformers 分词器的名称或路径。
+        tokenizer_mode: 分词器模式。"auto" 表示在可用时使用快速分词器，
+            "slow" 表示始终使用慢速分词器。
+        skip_tokenizer_init: 若为 True，则跳过分词器和反分词器的初始化。
+            此时要求输入中提供有效的 prompt_token_ids，并且 prompt 为 None。
+        trust_remote_code: 在下载模型和分词器时是否信任远程代码（例如来自 HuggingFace 的代码）。
+        allowed_local_media_path: 允许 API 请求从服务器文件系统中指定的目录
+            读取本地图像或视频。这存在安全风险，仅应在受信任的环境中启用。
+        allowed_media_domains: 若设置此参数，则仅允许属于该域名的媒体 URL
+            用于多模态输入。
+        tensor_parallel_size: 用于张量并行分布式执行的 GPU 数量。
+        dtype: 模型权重和激活值的数据类型。目前支持 `float32`、`float16` 和 `bfloat16`。
+            若设为 `auto`，则使用 Transformers 模型配置中的 `dtype` 属性。
+            但是，如果配置中的 `dtype` 是 `float32`，则会改用 `float16`。
+        quantization: 用于量化模型权重的方法。目前支持 "awq"、"gptq" 和 "fp8"（实验性）。
+            如果为 None，首先检查模型配置文件中的 `quantization_config` 属性。
+            如果该属性也为 None，则假定模型权重未量化，并使用 `dtype` 确定权重的数据类型。
+        revision: 要使用的具体模型版本，可以是分支名、标签名或提交 ID。
+        tokenizer_revision: 要使用的具体分词器版本，可以是分支名、标签名或提交 ID。
+        chat_template: 要应用的聊天模板。
+        seed: 用于初始化采样随机数生成器的种子。
+        gpu_memory_utilization: 保留用于模型权重、激活值和 KV 缓存的 GPU 内存比例（0 到 1 之间）。
+            较高的值会增大 KV 缓存大小，从而提高模型吞吐量。
+            但如果该值过高，可能会导致内存不足（OOM）错误。
+        kv_cache_memory_bytes: 每个 GPU 上 KV 缓存的大小（以字节为单位）。
+            默认为 None，此时 vLLM 会根据 gpu_memory_utilization 自动推断 KV 缓存大小。
+            但用户也可能希望手动指定 KV 缓存内存大小。
+            与使用 gpu_memory_utilization 相比，kv_cache_memory_bytes 提供了更精细的内存控制。
+            注意：当 kv_cache_memory_bytes 不为 None 时，将忽略 gpu_memory_utilization。
+        cpu_offload_gb: 用于卸载模型权重的 CPU 内存大小（单位：GiB）。
+            这实际上增加了可用于保存模型权重的 GPU 内存空间，
+            但代价是每次前向传播都需要进行 CPU-GPU 数据传输。
+        offload_group_size: 预取卸载（Prefetch offloading）：每 N 层划分为一组。
+            卸载每组中最后 `offload_num_in_group` 层。默认为 0（禁用）。
+        offload_num_in_group: 预取卸载：每组中要卸载的层数。默认为 1。
+        offload_prefetch_step: 预取卸载：提前预取的层数。
+            值越大可隐藏更多延迟，但会占用更多 GPU 内存。默认为 1。
+        offload_params: 预取卸载：要选择性卸载的参数名称片段集合。
+            只有名称包含这些片段之一的参数才会被卸载（例如，
+            {"gate_up_proj", "down_proj"} 表示 MLP 权重，
+            或 {"w13_weight", "w2_weight"} 表示 MoE 专家权重）。
+            如果为 None 或空，则卸载所有参数。
+        enforce_eager: 是否强制启用 eager 执行模式。
+            如果为 True，则禁用 CUDA Graph，始终以 eager 模式执行模型。
+            如果为 False，则混合使用 CUDA Graph 和 eager 执行。
+        enable_return_routed_experts: 是否返回路由专家信息。
+        disable_custom_all_reduce: 参见 [ParallelConfig][vllm.config.ParallelConfig]。
+        hf_token: 用于远程文件 HTTP Bearer 授权的 token。
+            如果设为 `True`，将使用运行 `hf auth login` 时生成的 token
+            （存储在 `~/.cache/huggingface/token` 中）。
+        hf_overrides: 如果是字典，则包含要传递给 HuggingFace 配置的参数；
+            如果是可调用对象，则用于更新 HuggingFace 配置。
+        mm_processor_kwargs: 传递给模型多模态处理器（如图像处理器）的参数，
+            用于覆盖通过 `AutoProcessor.from_pretrained` 获取的多模态处理器配置。
+            可用的覆盖项取决于所运行的模型。
+            例如，对于 Phi-3-Vision：`{"num_crops": 4}`。
+        pooler_config: 为池化模型初始化非默认的池化配置，
+            例如 `PoolerConfig(seq_pooling_type="MEAN", use_activation=False)`。
+        compilation_config: 可以是整数或字典。
+            如果是整数，则作为编译优化的模式；
+            如果是字典，则可指定完整的编译配置。
+        attention_config: 注意力机制的配置。可以是字典或 AttentionConfig 实例。
+            如果是字典，将被转换为 AttentionConfig。
+            允许指定注意力后端及其他注意力相关设置。
+        **kwargs: 传递给 [`EngineArgs`][vllm.EngineArgs] 的参数。
 
-    Note:
-        This class is intended to be used for offline inference. For online
-        serving, use the [AsyncLLMEngine][vllm.AsyncLLMEngine] class instead.
+    注意：
+        该类旨在用于离线推理。对于在线服务，请改用
+        [AsyncLLMEngine][vllm.AsyncLLMEngine] 类。
     """
 
     def __init__(
@@ -252,10 +226,112 @@ class LLM:
     ) -> None:
         """LLM constructor."""
 
+        from typing import Any
+from pathlib import Path
+import cloudpickle
+from pydantic import ValidationError
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 注意：为了代码能通过静态类型检查，我保留了原有的类型注解，
+# 实际运行环境中需要存在对应的类型定义（如 RunnerOption, ConvertOption 等）。
+
+class LLM:
+    def __init__(
+        self,
+        model: str,
+        *,
+        runner: "RunnerOption" = "auto",
+        convert: "ConvertOption" = "auto",
+        tokenizer: str | None = None,
+        tokenizer_mode: "TokenizerMode" | str = "auto",
+        skip_tokenizer_init: bool = False,
+        trust_remote_code: bool = False,
+        allowed_local_media_path: str = "",
+        allowed_media_domains: list[str] | None = None,
+        tensor_parallel_size: int = 1,
+        dtype: "ModelDType" = "auto",
+        quantization: "QuantizationMethods" | None = None,
+        revision: str | None = None,
+        tokenizer_revision: str | None = None,
+        chat_template: Path | str | None = None,
+        seed: int = 0,
+        gpu_memory_utilization: float = 0.9,
+        cpu_offload_gb: float = 0,
+        offload_group_size: int = 0,
+        offload_num_in_group: int = 1,
+        offload_prefetch_step: int = 1,
+        offload_params: set[str] | None = None,
+        enforce_eager: bool = False,
+        enable_return_routed_experts: bool = False,
+        disable_custom_all_reduce: bool = False,
+        hf_token: bool | str | None = None,
+        hf_overrides: "HfOverrides" | None = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+        pooler_config: "PoolerConfig" | None = None,
+        structured_outputs_config: dict[str, Any]
+        | "StructuredOutputsConfig"
+        | None = None,
+        profiler_config: dict[str, Any] | "ProfilerConfig" | None = None,
+        attention_config: dict[str, Any] | "AttentionConfig" | None = None,
+        kv_cache_memory_bytes: int | None = None,
+        compilation_config: int | dict[str, Any] | "CompilationConfig" | None = None,
+        logits_processors: list[str | type["LogitsProcessor"]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """
+        LLM (大语言模型) 推理引擎的构造函数。
+        
+        参数 (Args):
+            model: Hugging Face 模型名称或本地模型路径。
+            runner: 运行器选项，用于指定后端的执行模式，默认为 "auto"。
+            convert: 权重转换选项，默认为 "auto"。
+            tokenizer: 分词器的名称或路径。如果为 None，则默认使用与 `model` 相同的路径。
+            tokenizer_mode: 分词器的加载模式（例如 "slow", "fast" 或 "auto"）。
+            skip_tokenizer_init: 如果为 True，则跳过分词器的初始化（适用于纯视觉或纯特征提取任务）。
+            trust_remote_code: 是否允许在本地机器上执行来自 Hugging Face Hub 的自定义模型代码。开启需注意安全风险。
+            allowed_local_media_path: 多模态模型允许访问的本地多媒体文件路径（白名单机制）。
+            allowed_media_domains: 多模态模型允许从中下载多媒体文件的域名列表。
+            tensor_parallel_size: 张量并行的数量（通常对应使用的 GPU 数量）。
+            dtype: 模型权重的数据类型（如 "float16", "bfloat16", "auto"）。"auto" 会根据模型配置自动推断。
+            quantization: 使用的量化方法（如 "awq", "gptq", "squeezellm" 等）。如果为 None，则不进行量化。
+            revision: Hugging Face 模型的版本（branch 名字、tag 或者 commit hash）。
+            tokenizer_revision: Hugging Face 分词器的版本。
+            chat_template: 用于对话格式化的自定义 jinja 聊天模板的路径或字符串。
+            seed: 随机种子，用于确保生成过程的可重复性。
+            gpu_memory_utilization: 分配给模型和 KV Cache 的 GPU 显存比例（0 到 1 之间）。默认为 0.9 (90%)。
+            cpu_offload_gb: 卸载到 CPU 的模型参数/KV Cache 的容量限制（单位：GB）。
+            offload_group_size: 参数卸载相关的组大小配置。
+            offload_num_in_group: 卸载组内的数量配置。
+            offload_prefetch_step: 卸载时的预取步长，用于优化 I/O 延迟。
+            offload_params: 具体指定需要卸载的参数名称集合。
+            enforce_eager: 如果为 True，则强制使用 PyTorch Eager 模式执行（禁用 CUDA Graphs，便于调试或处理动态形状）。
+            enable_return_routed_experts: 是否允许返回 MoE（混合专家）模型中被激活的路由专家信息。
+            disable_custom_all_reduce: 如果为 True，则禁用自定义的 all-reduce 算子，回退到默认的 NCCL 操作。
+            hf_token: 访问私有或受限 Hugging Face 模型库所需的认证 Token。
+            hf_overrides: 传递给 Hugging Face `transformers` 模型配置的覆盖参数。
+            mm_processor_kwargs: 传递给多模态处理器（Multimodal Processor）的额外关键字参数。
+            pooler_config: 特征池化层（Pooler）的配置选项（常用于 Embedding 模型）。
+            structured_outputs_config: 结构化输出（如 JSON schema 约束生成）的配置参数。
+            profiler_config: 性能分析器（Profiler）的配置，用于分析推理性能瓶颈。
+            attention_config: 注意力机制后端的特定配置（例如 FlashAttention 的配置）。
+            kv_cache_memory_bytes: 强制指定分配给 KV Cache 的内存大小（字节）。如果不指定，将根据 gpu_memory_utilization 自动计算。
+            compilation_config: 模型编译（如 `torch.compile`）的配置选项，用于加速推理。
+            logits_processors: 用于修改或惩罚生成词汇概率分布的自定义逻辑处理器列表。
+            **kwargs: 其他未显式定义的额外参数。
+        """
+
+        # ---------------------------------------------------------
+        # 1. 向后兼容处理：处理已废弃的 'swap_space' 参数
+        # 遗弃是因为该参数改名为了cpu_offload
+        # ---------------------------------------------------------
         if "swap_space" in kwargs:
+            # 移除已废弃的参数，避免后续传递引发错误
             kwargs.pop("swap_space")
             import warnings
 
+            # 触发弃用警告，提醒开发者更新代码。stacklevel=2 表示警告指向调用者所在的代码行
             warnings.warn(
                 "The 'swap_space' parameter is deprecated and ignored. "
                 "It will be removed in a future version.",
@@ -263,69 +339,117 @@ class LLM:
                 stacklevel=2,
             )
 
+        # ---------------------------------------------------------
+        # 2. 默认行为设置：日志统计
+        # ---------------------------------------------------------
+        # 如果用户没有显式配置 disable_log_stats，则默认将其设置为 True (禁用统计日志打印)
         if "disable_log_stats" not in kwargs:
             kwargs["disable_log_stats"] = True
 
+        # ---------------------------------------------------------
+        # 3. 分布式执行 / Worker 处理逻辑
+        # 如果自己定义了一个类，这段函数保证它能被正确传递
+        # ---------------------------------------------------------
         if "worker_cls" in kwargs:
             worker_cls = kwargs["worker_cls"]
-            # if the worker_cls is not qualified string name,
-            # we serialize it using cloudpickle to avoid pickling issues
+            # 检查 worker_cls 是否为一个类类型 (class/type)
+            # 如果是类类型，因为在多进程 (multiprocessing/ray) 环境下直接传递类可能导致 pickling (序列化) 问题，
+            # 所以这里使用 cloudpickle 将其序列化成字节流安全地传递。
             if isinstance(worker_cls, type):
                 kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
 
+        # ---------------------------------------------------------
+        # 4. KV Cache 传输 / 离线推断的高级配置处理
+        # 检查kv传输的参数配置
+        # ---------------------------------------------------------
         if "kv_transfer_config" in kwargs and isinstance(
             kwargs["kv_transfer_config"], dict
         ):
+            # 将字典形式的配置实例化为数据类/Pydantic模型对象
             from vllm.config.kv_transfer import KVTransferConfig
 
             raw_config_dict = kwargs["kv_transfer_config"]
             try:
+                # 尝试通过字典解包实例化对象
                 kwargs["kv_transfer_config"] = KVTransferConfig(**raw_config_dict)
             except ValidationError as e:
+                # 捕获 Pydantic 抛出的校验错误（例如字典内缺失必填字段，或类型不符）
                 logger.error(
                     "Failed to convert 'kv_transfer_config' dict to "
                     "KVTransferConfig object. Dict: %s. Error: %s",
                     raw_config_dict,
                     e,
                 )
-                # Consider re-raising a more specific vLLM error or ValueError
-                # to provide better context to the user.
+                # 包装并重新抛出一个 ValueError，包含清晰的错误上下文，中断初始化
                 raise ValueError(f"Invalid 'kv_transfer_config' provided: {e}") from e
 
+        # ---------------------------------------------------------
+        # 5. 变量初始化兜底
+        # ---------------------------------------------------------
+        # 确保 hf_overrides 始终为一个字典对象，避免后续访问字典方法时抛出 NoneType 错误
         if hf_overrides is None:
             hf_overrides = {}
+            
 
+        # ---------------------------------------------------------
+        # 6. 配置对象实例化辅助函数
+        # ---------------------------------------------------------
         def _make_config(value: Any, cls: type[_R]) -> _R:
-            """Convert dict/None/instance to a config instance."""
+            """
+            将字典 (dict)、None 或现有的实例转换为目标配置类 (cls) 的实例。
+            这是一个内部闭包函数，用于统一处理各种复杂的子配置项。
+            """
             if value is None:
+                # 如果用户没传，返回该配置类的默认实例
                 return cls()
             if isinstance(value, dict):
+                # 如果用户传的是字典，则使用字典解包来实例化。
+                # is_init_field 配合过滤：只保留目标类 (cls) 真正需要的参数，
+                # 丢弃字典里多余/无效的键，防止抛出意外参数的错误。
                 return cls(**{k: v for k, v in value.items() if is_init_field(cls, k)})  # type: ignore[arg-type]
+            
+            # 如果已经是对应的类实例，直接返回
             return value
 
+        # ---------------------------------------------------------
+        # 7. 各种高级特性的配置解析
+        # ---------------------------------------------------------
+        # 处理模型编译配置 (Torch Compile 等机制)
         if isinstance(compilation_config, int):
+            # 如果传的是整数，通常代表预设的编译优化等级 (mode)
             compilation_config_instance = CompilationConfig(
                 mode=CompilationMode(compilation_config)
             )
         else:
+            # 否则通过常规字典或实例解析
             compilation_config_instance = _make_config(
                 compilation_config, CompilationConfig
             )
 
+        # 处理结构化输出 (如强制生成 JSON 格式)、性能分析器、注意力机制的特定配置
         structured_outputs_instance = _make_config(
             structured_outputs_config, StructuredOutputsConfig
         )
+        #性能记录器
         profiler_config_instance = _make_config(profiler_config, ProfilerConfig)
+        #注意力机制配置
         attention_config_instance = _make_config(attention_config, AttentionConfig)
 
-        # warn about single-process data parallel usage.
+        # ---------------------------------------------------------
+        # 8. 分布式 / 数据并行 (Data Parallel) 安全校验
+        # ---------------------------------------------------------
+        # 获取用户设置的数据并行大小（默认为 1）
         _dp_size = int(kwargs.get("data_parallel_size", 1))
+        # 获取分布式执行后端的类型
         _distributed_executor_backend = kwargs.get("distributed_executor_backend")
+        
+        # 危险操作拦截：如果试图在单进程模式下使用多个数据并行副本...
         if (
             _dp_size > 1
-            and not _distributed_executor_backend == "external_launcher"
-            and not current_platform.is_tpu()
+            and not _distributed_executor_backend == "external_launcher"  # 且没有使用外部启动器 (如 torchrun, ray)
+            and not current_platform.is_tpu()                             # 且当前硬件不是 TPU
         ):
+            # 抛出致命错误。因为在纯单进程环境 (普通 python 脚本) 里强行跑数据并行会导致进程死锁 (hang)。
             raise ValueError(
                 f"LLM(data_parallel_size={_dp_size}) is not supported for single-"
                 "process usage and may hang. Please use "
@@ -333,6 +457,12 @@ class LLM:
                 "'examples/offline_inference/data_parallel.py'."
             )
 
+        # ---------------------------------------------------------
+        # 9. 组装终极参数包 (EngineArgs)
+        # ---------------------------------------------------------
+        # 将用户传入的所有散装参数，以及刚刚处理好的实例化配置对象，
+        # 全部打包进一个标准化的数据类 EngineArgs 中。
+        # 这样做是为了隔离 API 层 (LLM类) 和 底层执行引擎层 (LLMEngine类) 的接口。
         engine_args = EngineArgs(
             model=model,
             runner=runner,
@@ -371,36 +501,59 @@ class LLM:
             **kwargs,
         )
 
+        # 记录所有非默认配置的日志，方便用户排查性能问题或行为异常
         log_non_default_args(engine_args)
 
+        # ---------------------------------------------------------
+        # 10. 核心动作：实例化底层大模型引擎
+        # ---------------------------------------------------------
+        # 这里是真正发生显存分配、模型权重加载、进程启动的地方。
+        # usage_context 告诉底层引擎：我是通过顶层的 `LLM` 类（通常是离线批处理模式）来调用的你。
         self.llm_engine = LLMEngine.from_engine_args(
             engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
         )
+        
+        # 将底层引擎解析好的模型配置保存到顶层属性，方便快速访问
         self.model_config = self.llm_engine.model_config
         self.engine_class = type(self.llm_engine)
 
+        # ---------------------------------------------------------
+        # 11. 初始化各种辅助工具、计数器和处理器
+        # ---------------------------------------------------------
+        # 用于为发给引擎的每个请求生成唯一的 ID
         self.request_counter = Counter()
         self.default_sampling_params: dict[str, Any] | None = None
 
+        # 获取该模型支持的任务类型（比如：是生成文本 Generation，还是提取特征 Embedding/Pooling）
         supported_tasks = self.llm_engine.get_supported_tasks()
         self.supported_tasks = supported_tasks
+        
+        # 检查是否包含池化（Pooling/Embedding）任务
         self.pooling_task = self.model_config.get_pooling_task(supported_tasks)
         if self.pooling_task is not None:
             logger.info("Supported pooling task: %s", self.pooling_task)
 
+        # 绑定渲染器（用于多模态图像/文本交错排版）、对话模板加载、输入/输出处理器
         self.runner_type = self.model_config.runner_type
         self.renderer = self.llm_engine.renderer
+        
+        # 加载用户提供的或者模型默认的 Jinja 对话模板 (Chat Template)
         self.chat_template = load_chat_template(chat_template)
+        
         self.io_processor = self.llm_engine.io_processor
         self.input_processor = self.llm_engine.input_processor
         self.chat_template_config = ChatTemplateConfig(chat_template=self.chat_template)
+        
+        # 如果支持 Pooling 任务，初始化对应的 I/O 处理器
         self.pooling_io_processors = init_pooling_io_processors(
             supported_tasks=supported_tasks,
             model_config=self.model_config,
             renderer=self.renderer,
             chat_template_config=self.chat_template_config,
         )
-        # Cache for __repr__ to avoid repeated collective_rpc calls
+        
+        # 缓存自身的 __repr__ 字符串表示。
+        # 因为在分布式环境下，获取引擎状态可能需要进行高昂的 RPC 通信，缓存可以提升打印对象时的性能。
         self._cached_repr: str | None = None
 
     @classmethod
@@ -441,46 +594,44 @@ class LLM:
 
     def generate(
         self,
-        prompts: PromptType | Sequence[PromptType],
-        sampling_params: SamplingParams | Sequence[SamplingParams] | None = None,
+        prompts: "PromptType" | Sequence["PromptType"],
+        sampling_params: "SamplingParams" | Sequence["SamplingParams"] | None = None,
         *,
-        use_tqdm: bool | Callable[..., tqdm] = True,
-        lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        use_tqdm: bool | Callable[..., "tqdm"] = True,
+        lora_request: Sequence["LoRARequest"] | "LoRARequest" | None = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
-    ) -> list[RequestOutput]:
-        """Generates the completions for the input prompts.
-
-        This class automatically batches the given prompts, considering
-        the memory constraint. For the best performance, put all of your prompts
-        into a single list and pass it to this method.
-
-        Args:
-            prompts: The prompts to the LLM. You may pass a sequence of prompts
-                for batch inference. See [PromptType][vllm.inputs.PromptType]
-                for more details about the format of each prompt.
-            sampling_params: The sampling parameters for text generation. If
-                None, we use the default sampling parameters.
-                When it is a single value, it is applied to every prompt.
-                When it is a list, the list must have the same length as the
-                prompts and it is paired one by one with the prompt.
-            use_tqdm: If `True`, shows a tqdm progress bar.
-                If a callable (e.g., `functools.partial(tqdm, leave=False)`),
-                it is used to create the progress bar.
-                If `False`, no progress bar is created.
-            lora_request: LoRA request to use for generation, if any.
-            priority: The priority of the requests, if any.
-                Only applicable when priority scheduling policy is enabled.
-                If provided, must be a list of integers matching the length
-                of `prompts`, where each priority value corresponds to the prompt
-                at the same index.
-            tokenization_kwargs: Overrides for `tokenizer.encode`.
-
-        Returns:
-            A list of `RequestOutput` objects containing the
-            generated completions in the same order as the input prompts.
+    ) -> list["RequestOutput"]:
         """
+        为输入的提示（prompts）生成补全文本。
+
+        该方法会自动对给定的提示进行批处理，并考虑内存限制。
+        为了获得最佳性能，请将所有提示放入一个列表中，然后一次性传入此方法。
+
+        参数 (Args)：
+            prompts: 输入给大模型的提示词。支持单条字符串，也支持字符串列表（进行批量推理）。
+            sampling_params: 控制文本生成的采样参数（如 temperature, top_p, max_tokens 等）。
+                - 如果为 None：使用模型默认参数。
+                - 如果是单个对象：该参数应用于列表中所有的提示词。
+                - 如果是列表：必须与 prompts 长度一致，实现“一对一”的个性化采样配置。
+            use_tqdm: 是否显示进度条。支持传入自定义的 tqdm 构造函数。
+            lora_request: 如果使用了 LoRA 微调插件，通过此参数指定要加载的 LoRA 适配器请求。
+            priority: 请求优先级。在任务极多时，优先级高的请求会排在前面。需要配合特定的调度策略。
+            tokenization_kwargs: 传递给分词器 (tokenizer.encode) 的额外参数，用于覆盖默认行为。
+
+        返回 (Returns)：
+            List[RequestOutput]: 生成结果列表，顺序与输入的 prompts 顺序严格对应。
+        """
+
+        # ---------------------------------------------------------
+        # 1. 任务类型校验：确保“专业对口”
+        # ---------------------------------------------------------
+        # 获取当前模型的运行器类型 (runner_type)。
+        # vLLM 支持多种模式，比如 "generate" (生成文本) 或 "pooling" (提取向量)。
         runner_type = self.model_config.runner_type
+        
+        # 如果模型被配置为“非生成类”任务（例如它是一个专门提取特征的 Embedding 模型），
+        # 却被调用了 .generate() 方法，则直接报错。
         if runner_type != "generate":
             raise ValueError(
                 "LLM.generate() is only supported for generative models. "
@@ -488,9 +639,22 @@ class LLM:
                 "generative model."
             )
 
+        # ---------------------------------------------------------
+        # 2. 默认参数补全
+        # ---------------------------------------------------------
+        # 如果用户没有传入任何采样参数 (sampling_params)，
+        # 则去获取系统初始化时设定的默认参数。
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
 
+        # ---------------------------------------------------------
+        # 3. 核心转发：进入真正的执行流程
+        # ---------------------------------------------------------
+        # LLM.generate 实际上是一个“壳”，它所有的重活儿都交给了内部私有方法 `_run_completion`。
+        # _run_completion 会负责：
+        #   a. 把文字通过 InputProcessor 转成 ID
+        #   b. 将请求发给刚才我们聊过的 EngineCore
+        #   c. 收集结果并返回给用户
         return self._run_completion(
             prompts=prompts,
             params=sampling_params,
@@ -1614,48 +1778,88 @@ class LLM:
 
     def _add_completion_requests(
         self,
-        prompts: PromptType | Sequence[PromptType],
-        params: SamplingParams
-        | PoolingParams
-        | Sequence[SamplingParams | PoolingParams],
+        prompts: "PromptType" | Sequence["PromptType"],
+        params: "SamplingParams"
+        | "PoolingParams"
+        | Sequence["SamplingParams" | "PoolingParams"],
         *,
-        use_tqdm: bool | Callable[..., tqdm] = True,
-        lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        use_tqdm: bool | Callable[..., "tqdm"] = True,
+        lora_request: Sequence["LoRARequest"] | "LoRARequest" | None = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
     ) -> list[str]:
+        """
+        内部方法：将原始输入转化为标准序列，预处理提示词，并将其正式注册到引擎中。
+        """
+
+        # ---------------------------------------------------------
+        # 1. 输入标准化 (Normalization)
+        # ---------------------------------------------------------
+        # 将输入强制转换为序列格式。
+        # 即使你只传了一个字符串 "Hello"，prompt_to_seq 也会把它变成 ["Hello"]。
         seq_prompts = prompt_to_seq(prompts)
+        
+        # 将采样参数、LoRA 请求和优先级也转为序列，并确保它们的长度与提示词数量对齐。
+        # 例如：如果你传了 10 个提示词但只传了 1 组参数，这里会自动将该参数复制 10 份。
         seq_params = self._params_to_seq(params, len(seq_prompts))
         seq_lora_requests = self._lora_request_to_seq(lora_request, len(seq_prompts))
-        seq_priority = self._priority_to_seq(priority, len(prompts))
+        seq_priority = self._priority_to_seq(priority, len(seq_prompts))
 
+        # ---------------------------------------------------------
+        # 2. 预处理与渲染 (Rendering)
+        # ---------------------------------------------------------
+        # 这里使用了生成器表达式，对每一个 prompt 进行迭代处理。
+        # maybe_tqdm 是一个工具，如果 use_tqdm=True，它就会在终端打印出渲染进度条。
+        
+        processed_prompts = (
+            # _preprocess_cmpl_one 是关键：
+            # 它负责把原始提示词（可能是文本、字典或图片）转换成 vLLM 内部通用的输入格式。
+            # 如果需要分词（Tokenization），也会在这里进行初步处理。
+            self._preprocess_cmpl_one(prompt, tokenization_kwargs)
+            for prompt in maybe_tqdm(
+                seq_prompts,
+                use_tqdm=use_tqdm,
+                desc="Rendering prompts", # 进度条显示的描述文字
+            )
+        )
+
+        # ---------------------------------------------------------
+        # 3. 提交给下一级处理器
+        # ---------------------------------------------------------
+        # 将预处理完的所有数据（提示词流、对齐后的参数、LoRA、优先级）
+        # 传给 _render_and_add_requests 方法。
+        # 该方法会为每个请求分配 Request ID，并真正塞进 EngineCore 的待处理队列中。
         return self._render_and_add_requests(
-            prompts=(
-                self._preprocess_cmpl_one(prompt, tokenization_kwargs)
-                for prompt in maybe_tqdm(
-                    seq_prompts,
-                    use_tqdm=use_tqdm,
-                    desc="Rendering prompts",
-                )
-            ),
+            prompts=processed_prompts,
             params=seq_params,
             lora_requests=seq_lora_requests,
             priorities=seq_priority,
         )
-
+    
     def _run_completion(
         self,
-        prompts: PromptType | Sequence[PromptType],
-        params: SamplingParams
-        | PoolingParams
-        | Sequence[SamplingParams | PoolingParams],
-        output_type: type[_O],
+        prompts: "PromptType" | Sequence["PromptType"],
+        params: "SamplingParams" 
+        | "PoolingParams" 
+        | Sequence["SamplingParams" | "PoolingParams"],
+        output_type: type["_O"],  # 期望的输出类型（如 RequestOutput 或 PoolingOutput）
         *,
-        use_tqdm: bool | Callable[..., tqdm] = True,
-        lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+        use_tqdm: bool | Callable[..., "tqdm"] = True,
+        lora_request: Sequence["LoRARequest"] | "LoRARequest" | None = None,
         priority: list[int] | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
     ):
+        """
+        内部核心执行方法：负责将输入请求送入引擎并循环直到生成结束。
+        """
+
+        # ---------------------------------------------------------
+        # 第一步：把“订单”加入待办队列 (_add_completion_requests)
+        # ---------------------------------------------------------
+        # 这个方法干了三件脏活：
+        # 1. 格式化：把各种奇奇怪怪的输入格式统一化。
+        # 2. Tokenize：调用分词器把文字变成数字 ID。
+        # 3. 注册：为每个提示词生成唯一 RequestID，并塞进底层引擎的待处理池里。
         self._add_completion_requests(
             prompts=prompts,
             params=params,
@@ -1664,6 +1868,16 @@ class LLM:
             priority=priority,
             tokenization_kwargs=tokenization_kwargs,
         )
+
+        # ---------------------------------------------------------
+        # 第二步：正式运转引擎 (_run_engine)
+        # ---------------------------------------------------------
+        # 这是真正的“计算循环”发生的地方。
+        # 只要引擎里还有没跑完的请求，这个方法就会不停地：
+        #   a. 命令 GPU 跑一次前向传播 (Step)。
+        #   b. 拿到这一轮出来的 Token。
+        #   c. 检查是不是有人已经生成完了（比如遇到了停止词 <|endoftext|>）。
+        #   d. 最终把所有结果打包成 output_type 指定的列表返回。
         return self._run_engine(use_tqdm=use_tqdm, output_type=output_type)
 
     def _run_chat(
@@ -1745,47 +1959,96 @@ class LLM:
         return self._run_engine(output_type, use_tqdm=use_tqdm)
 
     def _render_and_add_requests(
-        self,
-        prompts: Iterable[EngineInput],
-        params: Sequence[SamplingParams | PoolingParams],
-        *,
-        lora_requests: Sequence[LoRARequest | None] | None = None,
-        priorities: Sequence[int] | None = None,
-    ) -> list[str]:
-        added_request_ids: list[str] = []
+            self,
+            prompts: Iterable["EngineInput"],               # 经过预处理的可迭代输入流
+            params: Sequence["SamplingParams" | "PoolingParams"], # 对齐后的采样/池化参数序列
+            *,
+            lora_requests: Sequence["LoRARequest | None"] | None = None, # 选填：LoRA 适配器列表
+            priorities: Sequence[int] | None = None,        # 选填：每个请求的优先级
+        ) -> list[str]:
+            # 用于记录成功提交到引擎的所有请求 ID，方便出错时统一销毁
+            added_request_ids: list[str] = []
 
-        try:
-            for i, prompt in enumerate(prompts):
-                request_id = self._add_request(
-                    prompt,
-                    params[i],
-                    lora_request=self._resolve_mm_lora(
+            try:
+                # 1. 开始循环处理每一个请求
+                for i, prompt in enumerate(prompts):
+                    # 2. 调用内部方法 _add_request 真正将单个请求塞进引擎
+                    # 这里会发生：分配 Request ID、将请求转化为 EngineCoreRequest
+                    request_id = self._add_request(
                         prompt,
-                        None if lora_requests is None else lora_requests[i],
-                    ),
-                    priority=0 if priorities is None else priorities[i],
-                )
-                added_request_ids.append(request_id)
-        except Exception as e:
-            if added_request_ids:
-                self.llm_engine.abort_request(added_request_ids, internal=True)
-            raise e
+                        params[i],  # 对应索引的参数
+                        # -----------------------------------------------------
+                        # 3. 多模态 LoRA 解析 (_resolve_mm_lora)
+                        # -----------------------------------------------------
+                        # 如果是多模态模型（如图文），某些 LoRA 适配器可能需要特殊处理。
+                        # 这里会根据 prompt 内容和用户传入的 LoRA 请求，解析出最终适用的 LoRA 配置。
+                        lora_request=self._resolve_mm_lora(
+                            prompt,
+                            None if lora_requests is None else lora_requests[i],
+                        ),
+                        # 如果没有指定优先级，默认给 0 (普通)
+                        priority=0 if priorities is None else priorities[i],
+                    )
+                    
+                    # 将生成的 ID 存入临时列表
+                    added_request_ids.append(request_id)
 
-        return added_request_ids
+            except Exception as e:
+                # ---------------------------------------------------------
+                # 4. 原子性保证：失败回滚 (Fail-safe)
+                # ---------------------------------------------------------
+                # 这是一个非常硬核的设计。
+                # 假设你一次性提交 100 个任务，前 50 个成功了，但第 51 个因为显存瞬间爆了或其他原因挂了。
+                # 此时，前 50 个任务已经在 GPU 进程里开始跑了。
+                # 为了不浪费资源和保持状态一致，如果中间报错，要把已经提交成功的任务全部“撤回 (Abort)”。
+                if added_request_ids:
+                    # 告诉底层引擎：这一批任务作废，停止它们的计算并释放内存
+                    self.llm_engine.abort_request(added_request_ids, internal=True)
+                
+                # 继续向上抛出异常，让用户知道提交失败了
+                raise e
+
+            # 返回所有成功注册的任务 ID 列表
+            return added_request_ids
 
     def _add_request(
         self,
-        prompt: EngineInput,
-        params: SamplingParams | PoolingParams,
-        lora_request: LoRARequest | None = None,
-        priority: int = 0,
+        prompt: "EngineInput",                # 已经预处理好的输入（可能是 Token ID 或 文本+图片）
+        params: "SamplingParams | PoolingParams", # 生成参数（温度、Top-P 等）
+        lora_request: "LoRARequest | None" = None, # 选填：特定的 LoRA 权重
+        priority: int = 0,                    # 优先级（数字越小通常优先级越高）
     ) -> str:
+        """
+        内部方法：为单个请求分配 ID，进行最后的参数微调，并将其正式提交给底层引擎。
+        """
+
+        # ---------------------------------------------------------
+        # 1. 离线模式优化：只关心最终结果
+        # ---------------------------------------------------------
+        # 如果是生成任务（SamplingParams），这里会将输出类型强制设为 FINAL_ONLY。
+        # 为什么？
+        # 在离线批处理（Offline Inference）中，我们通常不需要像 ChatGPT 聊天那样“一个字一个字”地流式显示。
+        # 设置为 FINAL_ONLY 可以让底层引擎减少不必要的中间数据传输（IPC 往返），从而提升批量处理的吞吐量。
         if isinstance(params, SamplingParams):
-            # We only care about the final output
+            # 告诉引擎：别给我发中间过程，等整个句子写完了再一起给我。
             params.output_kind = RequestOutputKind.FINAL_ONLY
 
+        # ---------------------------------------------------------
+        # 2. 唯一身份标识生成 (ID Allocation)
+        # ---------------------------------------------------------
+        # 调用类属性中维护的 self.request_counter。
+        # next() 会让计数器自增 1，并转换成字符串。
+        # 这样确保了在同一个 LLM 实例中，每个请求都有一个唯一的“准考证号”。
         request_id = str(next(self.request_counter))
 
+        # ---------------------------------------------------------
+        # 3. 跨越边界：提交给底层核心引擎 (The Hand-off)
+        # ---------------------------------------------------------
+        # 这里正式调用了我们在初始化时创建的 self.llm_engine（即 LLMEngine 实例）。
+        # 一旦调用了这个 add_request，这个任务就正式进入了底层的：
+        #   - 调度器队列 (Scheduler Queue)
+        #   - 显存分配流程 (Block Manager)
+        # 此时，主线程只需要拿着这个 request_id，之后就可以去索要结果了。
         return self.llm_engine.add_request(
             request_id,
             prompt,

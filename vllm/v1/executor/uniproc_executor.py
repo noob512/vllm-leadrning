@@ -25,33 +25,77 @@ logger = init_logger(__name__)
 
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
-        """Initialize the worker and load the model."""
+        """
+        初始化工作节点 (Worker) 并将模型权重加载到 GPU 显存中。
+        这是单卡执行器启动时执行的第一波“重体力活”。
+        """
+        
+        # ---------------------------------------------------------
+        # 1. 实例化驱动工作节点 (Driver Worker)
+        # ---------------------------------------------------------
+        # 即使是单卡单进程，vLLM 依然保留了 Worker 的抽象概念。
+        # rpc_rank=0 表示这是主节点（也是这里唯一的一个节点）。
+        # WorkerWrapperBase 是对真正负责计算的 GPU Worker 的一层包装。
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
+        
+        # 获取分布式参数（即使是单卡，为了兼容底层 PyTorch 统一的接口，
+        # 依然需要模拟出 rank=0, local_rank=0 的分布式环境上下文）
         distributed_init_method, rank, local_rank = self._distributed_args()
+        
+        # 打包初始化参数
         kwargs = dict(
-            vllm_config=self.vllm_config,
-            local_rank=local_rank,
-            rank=rank,
-            distributed_init_method=distributed_init_method,
-            is_driver_worker=True,
-            shared_worker_lock=Lock(),
+            vllm_config=self.vllm_config,             # 全局配置
+            local_rank=local_rank,                    # 本机 GPU 编号 (通常是 0)
+            rank=rank,                                # 全局进程编号 (通常是 0)
+            distributed_init_method=distributed_init_method, # 分布式初始化方法
+            is_driver_worker=True,                    # 标记为主驱动节点
+            shared_worker_lock=Lock(),                # 线程锁，保证单进程下并发调用的线程安全
         )
 
+        # ---------------------------------------------------------
+        # 2. 异步输出处理线程 (Pipeline/Overlap 优化)
+        # ---------------------------------------------------------
         self.async_output_thread: ThreadPoolExecutor | None = None
+        # max_concurrent_batches > 1 通常发生在开启了流水线并行 (Pipeline Parallelism) 
+        # 或者启用了特定的异步调度优化时。
         if self.max_concurrent_batches > 1:
+            # 开启一个独立的后台线程。
+            # 作用：当 GPU 还在算下一个 batch 时，这个线程可以提前把上一个 batch 
+            # 算好的输出 (Logits/Tokens) 从 GPU 搬回 CPU 并进行处理。
+            # 这实现了 CPU 和 GPU 的时间重叠 (Overlap)，极大提升了吞吐量。
             self.async_output_thread = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="WorkerAsyncOutput"
             )
 
+        # ---------------------------------------------------------
+        # 3. 真正初始化 Worker 并绑定显卡
+        # ---------------------------------------------------------
+        # 将上面打包好的参数传给 Worker 进行内部状态的初始化
         self.driver_worker.init_worker(all_kwargs=[kwargs])
+        
+        # 初始化设备：底层会调用 torch.cuda.set_device()，
+        # 确保当前的 Python 进程死死绑定在指定的这一块 GPU 上。
         self.driver_worker.init_device()
 
+        # ---------------------------------------------------------
+        # 4. 加载模型权重 (The Heavy Lifting)
+        # ---------------------------------------------------------
+        # 这是一个针对弹性专家并行 (Elastic Expert Parallelism, 常用于 MoE 模型) 的特殊分支。
+        # 如果启用了弹性扩展，使用特殊的加载逻辑。
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.driver_worker.elastic_ep_execute("load_model")
         else:
+            # 常规路径：从磁盘或 HuggingFace 缓存中读取几十 GB 的权重，
+            # 并搬运到刚才绑定的 GPU 显存中。这通常是启动过程中最耗时的一步。
             self.driver_worker.load_model()
+            
+        # ---------------------------------------------------------
+        # 5. 平台相关的底层对齐
+        # ---------------------------------------------------------
+        # 不同的硬件平台（NVIDIA CUDA vs AMD ROCm）对显存块 (Block) 
+        # 有不同的底层对齐要求。这一步会根据当前硬件更新 PagedAttention 的 Block 大小。
         current_platform.update_block_size_for_backend(self.vllm_config)
-
+        
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
         distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -102,16 +146,46 @@ class UniProcExecutor(Executor):
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        """
+        通知所有底层 Worker 执行一次模型的前向传播（Forward Pass）。
+        
+        参数:
+        - scheduler_output: 调度器刚生成的“施工图纸”，包含要计算哪些 Token、用哪些物理显存块。
+        - non_block: 是否使用非阻塞模式。如果是 True，函数会立刻返回一个 Future，而不用等 GPU 算完。
+        
+        返回值:
+        - 可能是直接的模型输出 (ModelRunnerOutput)
+        - 或者是包含模型输出的异步对象 (Future)
+        """
+
+        # ---------------------------------------------------------
+        # 1. 发起集体远程调用 (Collective RPC)
+        # ---------------------------------------------------------
+        # 这是 vLLM 分布式架构的核心！
+        # 无论你底层是单机多卡 (mp) 还是多机多卡 (Ray)，collective_rpc 会把这道命令
+        # 【同时】广播给当前 Tensor Parallelism (张量并行) 组里的所有 GPU 进程。
+        # 
+        # 指令内容：调用目标进程的 "execute_model" 方法。
+        # 携带参数：把 scheduler_output 传过去。
         output = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
             non_block=non_block,
-            single_value=True,
+            single_value=True, # 表明所有 worker 算出的是同一个逻辑结果（虽然各算各的碎片），我们只需要拿 Rank 0 的返回值即可。
         )
-        # In non-blocking mode, surface any exception as early as possible.
+        
+        # ---------------------------------------------------------
+        # 2. 非阻塞模式下的快速失败检测 (Fast-fail mechanism)
+        # ---------------------------------------------------------
+        # 在非阻塞模式下，output 是一个 Future 对象（异步凭证）。
+        # 这里进行一次极速的探查：如果这个任务在发出的瞬间就已经完成了（通常是因为抛出了异常退出），
+        # 我们就立刻调用 .result()。
         if non_block and output.done():
-            # Raise the exception in-line if the task failed.
+            # 调用 .result() 的目的是让异常在“这里”就抛出来（in-line raise），
+            # 而不是等到外层代码去 await 这个 Future 时才报错，这有助于获得更精准的报错堆栈。
             output.result()
+            
+        # 把计算结果（或 Future 凭证）交还给外层的 step() 方法
         return output
 
     def sample_tokens(  # type: ignore[override]

@@ -280,60 +280,92 @@ def make_zmq_path(scheme: str, host: str, port: int | None = None) -> str:
     return f"{scheme}://{host}:{port}"
 
 
-# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783 # noqa: E501
+# 该函数适配自 SGLang 项目，专门为大模型推理（SRT）优化了 ZMQ 的传输性能
 def make_zmq_socket(
-    ctx: zmq.asyncio.Context | zmq.Context,  # type: ignore[name-defined]
-    path: str,
-    socket_type: Any,
-    bind: bool | None = None,
-    identity: bytes | None = None,
-    linger: int | None = None,
-    router_handover: bool = False,
-) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
-    """Make a ZMQ socket with the proper bind/connect semantics."""
+    ctx: zmq.asyncio.Context | zmq.Context,  # ZMQ 上下文（支持异步或同步）
+    path: str,                              # 套接字连接路径（如 ipc://... 或 tcp://...）
+    socket_type: Any,                       # ZMQ 套接字类型（如 PUSH, PULL, ROUTER 等）
+    bind: bool | None = None,               # 是执行 bind (服务端) 还是 connect (客户端)
+    identity: bytes | None = None,          # 套接字身份标识（用于 ROUTER/DEALER 路由）
+    linger: int | None = None,              # 关闭时的残留时间（毫秒）
+    router_handover: bool = False,          # 是否允许 ROUTER 身份接管
+) -> zmq.Socket | zmq.asyncio.Socket:
+    """创建一个具有正确 绑定(bind)/连接(connect) 语义并经过性能优化的 ZMQ 套接字。"""
 
+    # 获取系统虚拟内存状态，用于后续动态调整缓冲区大小
     mem = psutil.virtual_memory()
     socket = ctx.socket(socket_type)
 
-    # Calculate buffer size based on system memory
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    # For systems with substantial memory (>32GB total, >16GB available):
-    # - Set a large 0.5GB buffer to improve throughput
-    # For systems with less memory:
-    # - Use system default (-1) to avoid excessive memory consumption
+    # ---------------------------------------------------------
+    # 1. 动态缓冲区优化 (Throughput Optimization)
+    # ---------------------------------------------------------
+    # 目的：在大内存机器上通过增大 TCP/IPC 缓冲区来提升大数据块（如 Tensor）的传输吞吐量。
+    total_mem = mem.total / 1024**3      # 总内存 (GB)
+    available_mem = mem.available / 1024**3 # 可用内存 (GB)
+    
+    # 性能策略：
+    # - 如果系统内存充足 (>32GB 总量且 >16GB 可用)：
+    #   设置一个巨大的 0.5GB (512MB) 缓冲区。这对于传输多模态大图片或 KV Cache 至关重要。
+    # - 如果内存较小：
+    #   使用系统默认值 (-1)，防止因分配过多缓冲区导致 OOM。
     buf_size = int(0.5 * 1024**3) if total_mem > 32 and available_mem > 16 else -1
 
+    # ---------------------------------------------------------
+    # 2. 自动判定 Bind/Connect 语义
+    # ---------------------------------------------------------
+    # 如果用户没指定 bind，则根据 ZMQ 的标准惯例自动判定：
+    # PUSH, SUB, XSUB 通常作为下游客户端 (connect)
     if bind is None:
         bind = socket_type not in (zmq.PUSH, zmq.SUB, zmq.XSUB)
 
+    # ---------------------------------------------------------
+    # 3. 高水位标志 (HWM) 与 缓冲区设置
+    # ---------------------------------------------------------
+    # RCVHWM/SNDHWM = 0 表示不限制内存队列长度，防止因队列满而丢弃推理请求。
+    # RCVBUF/SNDBUF 设置为上面计算出的 buf_size。
+    
+    # 接收端优化
     if socket_type in (zmq.PULL, zmq.DEALER, zmq.ROUTER):
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
 
+    # 发送端优化
     if socket_type in (zmq.PUSH, zmq.DEALER, zmq.ROUTER):
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
 
+    # ---------------------------------------------------------
+    # 4. 路由接管机制 (ROUTER Handover)
+    # ---------------------------------------------------------
+    # 场景：当一个 GPU 进程崩溃后立即重启，它会使用相同的 Identity 重新连接。
+    # 开启此选项后，ROUTER 会允许新连接直接替换掉旧的“死连接”，实现无缝恢复。
     if socket_type == zmq.ROUTER and router_handover:
-        # Let a new connection take over an identity left behind by a dead one.
         socket.setsockopt(zmq.ROUTER_HANDOVER, 1)
 
+    # ---------------------------------------------------------
+    # 5. 其他常规设置
+    # ---------------------------------------------------------
     if identity is not None:
         socket.setsockopt(zmq.IDENTITY, identity)
 
     if linger is not None:
         socket.setsockopt(zmq.LINGER, linger)
 
+    # XPUB 模式下开启详细日志，用于监控订阅状态
     if socket_type == zmq.XPUB:
         socket.setsockopt(zmq.XPUB_VERBOSE, True)
 
-    # Determine if the path is a TCP socket with an IPv6 address.
-    # Enable IPv6 on the zmq socket if so.
+    # ---------------------------------------------------------
+    # 6. IPv6 自动检测与适配
+    # ---------------------------------------------------------
+    # 解析路径，如果发现是基于 TCP 的 IPv6 地址，则显式开启套接字的 IPv6 支持。
     scheme, host, _ = split_zmq_path(path)
     if scheme == "tcp" and is_valid_ipv6_address(host):
         socket.setsockopt(zmq.IPV6, 1)
 
+    # ---------------------------------------------------------
+    # 7. 最终连接
+    # ---------------------------------------------------------
     if bind:
         socket.bind(path)
     else:

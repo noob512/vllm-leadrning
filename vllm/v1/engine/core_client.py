@@ -67,38 +67,67 @@ EngineIdentity = bytes
 
 class EngineCoreClient(ABC):
     """
-    EngineCoreClient: subclasses handle different methods for pushing
-        and pulling from the EngineCore for asyncio / multiprocessing.
+    EngineCoreClient：其子类处理通过 asyncio 或多进程与 EngineCore 进行推送和拉取的不同方法。
 
-    Subclasses:
-    * InprocClient: In process EngineCore (for V0-style LLMEngine use)
-    * SyncMPClient: ZMQ + background proc EngineCore (for LLM)
-    * AsyncMPClient: ZMQ + background proc EngineCore w/ asyncio (for AsyncLLM)
+    子类包括：
+    InprocClient：进程内 EngineCore（用于 V0 风格的 LLMEngine）
+    SyncMPClient：基于 ZMQ + 后台进程的 EngineCore（用于 LLM）
+    AsyncMPClient：基于 ZMQ + 后台进程的 EngineCore，并支持 asyncio（用于 AsyncLLM）
     """
 
     @staticmethod
     def make_client(
-        multiprocess_mode: bool,
-        asyncio_mode: bool,
+        multiprocess_mode: bool,  # 是否开启多进程解耦（前台大堂与后厨分离）
+        asyncio_mode: bool,       # 前台是否使用 asyncio 异步并发模式（FastAPI 等 Web 框架通常使用）
         vllm_config: VllmConfig,
         executor_class: type[Executor],
         log_stats: bool,
     ) -> "EngineCoreClient":
-        # TODO: support this for debugging purposes.
+        """
+        根据不同的并发模式，动态实例化并返回对应的 EngineCore 客户端（通信代理）。
+        """
+        
+        # ---------------------------------------------------------
+        # 场景 1：单进程 + 异步 (目前被禁用)
+        # ---------------------------------------------------------
+        # 如果不开多进程，但又想用纯 asyncio 异步去调底层 GPU，直接报错。
+        # 为什么？因为底层模型推理是极其沉重的 CPU/GPU 阻塞计算（计算密集型）。
+        # 如果在一个进程里跑，巨大的计算会瞬间卡死 Python 的 asyncio 事件循环 (Event Loop)，
+        # 导致异步不仅没用，反而更慢甚至崩溃。
         if asyncio_mode and not multiprocess_mode:
             raise NotImplementedError(
                 "Running EngineCore in asyncio without multiprocessing "
                 "is not currently supported."
             )
 
+        # ---------------------------------------------------------
+        # 场景 2：多进程 + 异步 (终极完全体：Async MP Client)
+        # ---------------------------------------------------------
+        # 适用场景：线上部署的高并发 API 服务器（如 OpenAI 兼容接口 / FastAPI）。
+        # 工作机制：前台大堂用 asyncio 非阻塞地接待成千上万的并发请求，
+        # 然后通过高性能的异步进程间通信（通常基于 ZeroMQ 等 IPC 机制）把任务扔给后厨进程。
+        # 前台扔完就去接下一个客，绝不干等，吞吐量达到极致。
         if multiprocess_mode and asyncio_mode:
             return EngineCoreClient.make_async_mp_client(
                 vllm_config, executor_class, log_stats
             )
 
+        # ---------------------------------------------------------
+        # 场景 3：多进程 + 同步 (Sync MP Client)
+        # ---------------------------------------------------------
+        # 适用场景：需要隔离后厨（规避 GIL 锁），但前台是传统阻塞式调用的场景。
+        # 工作机制：虽然前后台分开了，但大堂经理把单子递给后厨后，
+        # 会傻傻地站在“传菜窗口”死等（阻塞等待进程间通信的返回），拿到菜才去接待下一桌。
         if multiprocess_mode and not asyncio_mode:
             return SyncMPClient(vllm_config, executor_class, log_stats)
 
+        # ---------------------------------------------------------
+        # 场景 4：单进程 + 同步 (In-process Client)
+        # ---------------------------------------------------------
+        # 适用场景：用户在本地跑脚本（Offline Inference），或者 Debug 调试阶段。
+        # 工作机制：没有花里胡哨的网络通信和多进程。大堂经理就是厨师本人。
+        # 直接在当前进程的内存空间里，通过常规的 Python 函数调用（Function Call）来执行计算。
+        # 最简单、最好调试，但受制于 GIL 锁，无法发挥最大并发性能。
         return InprocClient(vllm_config, executor_class, log_stats)
 
     @staticmethod
@@ -479,58 +508,66 @@ class MPClient(EngineCoreClient):
     ):
         self.vllm_config = vllm_config
 
-        # ZMQ setup.
+        # ---------------------------------------------------------
+        # 1. 铺设底层电缆：ZeroMQ 上下文初始化
+        # ---------------------------------------------------------
+        # 创建一个拥有 2 个 IO 线程的 ZMQ 上下文。
+        # 如果是 asyncio 模式，则包装成异步上下文，否则保持同步。
         sync_ctx = zmq.Context(io_threads=2)
         self.ctx = zmq.asyncio.Context(sync_ctx) if asyncio_mode else sync_ctx
 
-        # This will ensure resources created so far are closed
-        # when the client is garbage collected, even if an
-        # exception is raised mid-construction.
+        # ---------------------------------------------------------
+        # 2. 安全退出保障：内存资源回收机制
+        # ---------------------------------------------------------
+        # BackgroundResources 是一个容器，存放着所有需要手动关闭的 Socket 和进程句柄。
         self.resources = BackgroundResources(ctx=sync_ctx)
+        # 极其严谨的设计：使用弱引用终结器（weakref.finalize）。
+        # 即使构造函数中途报错，或者 Client 对象被垃圾回收，也会触发 self.resources 进行资源清理，
+        # 防止显存泄漏或僵尸进程。
         self._finalizer = weakref.finalize(self, self.resources)
+        
         success = False
         try:
-            # State used for data parallel.
             self.engines_running = False
             parallel_config = vllm_config.parallel_config
-            # Elastic EP can remove a rank and later add it back with the same
-            # identity. The client input ROUTER needs handover to allow the new
-            # engine to replace the dead connection.
+            # 弹性扩展支持：如果开启了 Elastic EP，ROUTER 套接字允许新的引擎实例替换掉旧的连接。
             enable_input_socket_handover = parallel_config.enable_elastic_ep
 
             self.stats_update_address: str | None = None
             tensor_queue: Queue | None = None
+
+            # ---------------------------------------------------------
+            # 3. 建立通信连接：ROUTER (发) 与 PULL (收)
+            # ---------------------------------------------------------
             if client_addresses:
-                # Engines are managed externally to this client.
+                # 场景 A：引擎已在外部启动（比如在另一个容器里），直接连地址。
                 input_address = client_addresses["input_address"]
                 output_address = client_addresses["output_address"]
                 self.stats_update_address = client_addresses.get("stats_update_address")
-                # Tensor queues passed via client_addresses for multi-API-server case
-                tensor_queue = client_addresses.get("tensor_queue")  # type: ignore[assignment]
+                tensor_queue = client_addresses.get("tensor_queue")
+                
+                # 创建输入 Socket (ROUTER 类型，支持多目标路由)
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
-                    self.ctx,
-                    input_address,
-                    zmq.ROUTER,
-                    bind=True,
+                    self.ctx, input_address, zmq.ROUTER, bind=True,
                     router_handover=enable_input_socket_handover,
                 )
+                # 创建输出 Socket (PULL 类型，负责单向接收结果)
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, output_address, zmq.PULL
                 )
             else:
-                # Engines are managed by this client.
+                # 场景 B：由当前 Client 亲手启动引擎（最常见的本地运行模式）。
                 addresses = get_engine_zmq_addresses(vllm_config)
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
-                    self.ctx,
-                    addresses.inputs[0],
-                    zmq.ROUTER,
-                    bind=True,
+                    self.ctx, addresses.inputs[0], zmq.ROUTER, bind=True,
                     router_handover=enable_input_socket_handover,
                 )
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, addresses.outputs[0], zmq.PULL
                 )
 
+                # 【重点！！】：这里就是 GPU 子进程诞生的时刻
+                # launch_core_engines 会真正调用 multiprocessing.Process。
                 with launch_core_engines(
                     vllm_config, executor_class, log_stats, addresses
                 ) as (engine_manager, coordinator, addresses, tensor_queue):
@@ -538,74 +575,68 @@ class MPClient(EngineCoreClient):
                     self.resources.engine_manager = engine_manager
 
                 self.stats_update_address = addresses.frontend_stats_publish_address
-                if coordinator is not None:
-                    assert self.stats_update_address == (
-                        coordinator.get_stats_publish_address()
-                    )
 
-            # Serialization setup with tensor queues for multimodal tensor IPC.
+            # ---------------------------------------------------------
+            # 4. 多模态黑科技：跨进程 Tensor 直接传输 (IPC)
+            # ---------------------------------------------------------
             tensor_ipc_sender: TensorIpcSender | None = None
             model_config = getattr(vllm_config, "model_config", None)
             if model_config is not None and model_config.multimodal_config is not None:
+                # 如果是多模态任务且配置了 torch_shm (共享内存)，则开启 Tensor IPC 发送器。
+                # 这样庞大的图片 Tensor 就不需要序列化了，直接走共享内存。
                 mm_tensor_ipc = model_config.multimodal_config.mm_tensor_ipc
                 if mm_tensor_ipc == "torch_shm" and tensor_queue is not None:
                     tensor_ipc_sender = TensorIpcSender(tensor_queue)
 
+            # 序列化工具：使用高性能的 Msgpack 协议
             self.encoder = MsgpackEncoder(oob_tensor_consumer=tensor_ipc_sender)
             self.decoder = MsgpackDecoder(EngineCoreOutputs)
 
-            dp_size = parallel_config.data_parallel_size
+            # ---------------------------------------------------------
+            # 5. 确定管理范围：我需要管哪些 GPU 核心 (Rank)
+            # ---------------------------------------------------------
             dp_rank = parallel_config.data_parallel_index
-            dp_local_size = parallel_config.data_parallel_size_local
-            offline_mode = parallel_config.data_parallel_rank_local is not None
-            # Client manages local+remote EngineCores in pure internal LB case.
-            # Client manages local EngineCores in hybrid and external LB case.
-            num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
-            self.engine_ranks_managed = (
-                [dp_rank] if offline_mode else list(range(dp_rank, dp_rank + num_ranks))
-            )
-            assert parallel_config.data_parallel_size_local <= len(
-                self.engine_ranks_managed
-            )
+            num_ranks = parallel_config.data_parallel_size_local if parallel_config.local_engines_only else parallel_config.data_parallel_size
+            self.engine_ranks_managed = list(range(dp_rank, dp_rank + num_ranks))
 
-            # ZMQ identity of each engine that this client will talk to.
+            # 转换成 ZMQ 路由身份 ID (2 字节小端序)
             self.core_engines: list[EngineIdentity] = [
                 rank.to_bytes(2, "little") for rank in self.engine_ranks_managed
             ]
 
-            # Wait for ready messages from each engine on the input socket.
+            # ---------------------------------------------------------
+            # 6. 对暗号：等待 GPU 进程就绪 (The Handshake)
+            # ---------------------------------------------------------
+            # 因为模型加载非常慢（几百亿参数），主进程必须等子进程加载完权重。
             identities = set(self.core_engines)
+            # 使用 shadow socket 创建一个同步副本，专门用于握手。
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
             while identities:
-                if not sync_input_socket.poll(
-                    timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
-                ):
-                    raise TimeoutError(
-                        f"Timed out waiting for engine core processes to "
-                        f"start. This is often caused by slow weight loading "
-                        f"for large models. Waited "
-                        f"{VLLM_ENGINE_READY_TIMEOUT_S}s (configured by "
-                        f"VLLM_ENGINE_READY_TIMEOUT_S). To increase the "
-                        f"timeout, set the environment variable: "
-                        f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
-                    )
+                # 轮询直到收到每个 GPU 进程发来的“就绪”信号。
+                if not sync_input_socket.poll(timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000):
+                    # 如果超时（通常因为权重加载太慢），抛出带有环境提示的超时错误。
+                    raise TimeoutError(f"等待引擎核心启动超时（配置：{VLLM_ENGINE_READY_TIMEOUT_S}s）...")
+                
                 identity, _ = sync_input_socket.recv_multipart()
-                identities.remove(identity)
+                identities.remove(identity) # 收到一个，划掉一个
 
+            # 默认操作第一个引擎核心
             self.core_engine: EngineIdentity = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
 
-            # Request objects which may contain pytorch-allocated tensors
-            # that we need to keep references to until zmq is done with the
-            # underlying data.
+            # 初始化待处理消息队列（用于零拷贝追踪）
             self.pending_messages = deque[tuple[zmq.MessageTracker, Any]]()
 
-            # Start monitoring engine core processes for unexpected failures
+            # ---------------------------------------------------------
+            # 7. 启动监护人：心跳监控
+            # ---------------------------------------------------------
+            # 启动一个独立逻辑，时刻盯着 GPU 进程，如果它们意外退出了，主进程能立刻感知。
             self.start_engine_core_monitor()
 
             success = True
         finally:
             if not success:
+                # 如果初始化过程中间挂了，手动触发清理逻辑。
                 self._finalizer()
 
     def shutdown(self, timeout: float | None = None) -> None:
@@ -687,11 +718,13 @@ def _process_utility_output(
 
 class SyncMPClient(MPClient):
     """Synchronous client for multi-proc EngineCore."""
+    # 用于多进程 (Multi-proc) 底层引擎核心 (EngineCore) 的同步客户端。
 
     @instrument(span_name="SyncMPClient init")
     def __init__(
         self, vllm_config: VllmConfig, executor_class: type[Executor], log_stats: bool
     ):
+        # 1. 调用父类 (MPClient) 初始化，明确声明不使用 asyncio 异步模式
         super().__init__(
             asyncio_mode=False,
             vllm_config=vllm_config,
@@ -700,51 +733,87 @@ class SyncMPClient(MPClient):
         )
 
         self.is_dp = self.vllm_config.parallel_config.data_parallel_size > 1
+        
+        # 2. 核心数据结构：线程安全的输出队列
+        # 这个队列是“接收线程”和“主线程”之间传递 GPU 计算结果的桥梁。
         self.outputs_queue = queue.Queue[EngineCoreOutputs | Exception]()
 
-        # Ensure that the outputs socket processing thread does not have
-        # a ref to the client which prevents gc.
+        # ---------------------------------------------------------
+        # 3. 极其硬核的 Python 内存管理技巧：消除闭包对 self 的强引用
+        # ---------------------------------------------------------
+        # 下面我们要定义一个后台线程函数 `process_outputs_socket`。
+        # 如果在这个函数内部直接写 `self.outputs_queue.put(...)`，
+        # 这个后台线程就会死死“抓住 (持有)”当前 Client 对象的引用 (ref)。
+        # 导致即使 Client 已经没用了，Python 的垃圾回收器 (GC) 也无法释放它，造成内存泄漏。
+        # 做法：把需要的属性全部提取为局部变量，线程内部只用局部变量，彻底与 `self` 解绑。
         ctx = self.ctx
         out_socket = self.resources.output_socket
         decoder = self.decoder
         utility_results = self.utility_results
         outputs_queue = self.outputs_queue
 
+        # 准备一个 ZeroMQ 的进程内 (inproc) 虚拟路径，用于发送“关机/退出”信号
         shutdown_path = get_open_zmq_inproc_path()
         resources = self.resources
         resources.shutdown_path = shutdown_path
 
+        # ---------------------------------------------------------
+        # 4. 后台监听线程函数：专门盯着后厨 (GPU 进程) 的出菜口
+        # ---------------------------------------------------------
         def process_outputs_socket():
             assert isinstance(out_socket, zmq.Socket)
+            # 创建一个配对套接字，专门用来接收主线程发来的“下班”信号
             shutdown_socket = ctx.socket(zmq.PAIR)
             try:
                 shutdown_socket.bind(shutdown_path)
+                
+                # 使用 ZeroMQ 的 Poller (多路复用轮询器)
+                # 它可以同时监听两个地方：一个是出菜口 (out_socket)，一个是老板的喇叭 (shutdown_socket)
                 poller = zmq.Poller()
                 poller.register(shutdown_socket, zmq.POLLIN)
                 poller.register(out_socket, zmq.POLLIN)
+                
+                # 死循环，一直盯着
                 while True:
-                    socks = poller.poll()
+                    socks = poller.poll()  # 阻塞在这里，直到有消息来
                     if not socks:
                         continue
+                        
+                    # 如果老板喊下班了 (收到了 shutdown 信号)，立刻跳出循环，结束线程
                     if len(socks) == 2 or socks[0][0] == shutdown_socket:
                         # shutdown signal, exit thread.
                         break
 
+                    # 如果是出菜口有动静，接收 GPU 传过来的二进制数据 (Zero-copy 零拷贝技术，提升性能)
                     frames = out_socket.recv_multipart(copy=False)
+                    
+                    # 检查一下 GPU 进程是不是因为 OOM(显存溢出) 崩掉了
                     resources.validate_alive(frames)
+                    
+                    # 将二进制数据反序列化为 Python 对象 (EngineCoreOutputs)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
+                    
+                    # 判断这是不是纯业务逻辑 (比如测速、探活的 utility 输出)
                     if outputs.utility_output:
                         _process_utility_output(outputs.utility_output, utility_results)
                     else:
+                        # 如果是真实的模型推理结果，把它塞进刚刚准备好的 Python 队列里
+                        # 此时，在外面傻等的主线程就可以从队列里拿走结果了
                         outputs_queue.put_nowait(outputs)
+                        
             except Exception as e:
+                # 哪怕发生致命错误，也要把错误信息塞进队列传出去，不能让主线程一直死等
                 outputs_queue.put_nowait(e)
             finally:
-                # Close sockets.
+                # 最终无论如何，清理战场，关闭套接字 (linger=0 表示不等待，强制丢弃未发完的数据)
                 shutdown_socket.close(linger=0)
                 out_socket.close(linger=0)
 
-        # Process outputs from engine in separate thread.
+        # ---------------------------------------------------------
+        # 5. 启动后台守护线程
+        # ---------------------------------------------------------
+        # 把刚才写的函数扔进一个新线程里跑。
+        # daemon=True (守护线程) 意味着：如果主程序崩了或退出了，这个线程会乖乖跟着陪葬，不会变成僵尸线程。
         self.output_queue_thread = Thread(
             target=process_outputs_socket,
             name="EngineCoreOutputQueueThread",
@@ -752,7 +821,9 @@ class SyncMPClient(MPClient):
         )
         self.output_queue_thread.start()
 
-        # The thread takes on responsibility for closing the socket.
+        # 6. 交接管辖权
+        # 原本套接字是归 Client 管的，现在全权委托给后台线程了，
+        # Client 主动放手 (赋为 None)，防止两边同时操作同一个网络端口导致冲突。
         self.resources.output_socket = None
 
     def get_output(self) -> EngineCoreOutputs:
@@ -768,17 +839,57 @@ class SyncMPClient(MPClient):
         return outputs
 
     def _send_input(self, request_type: EngineCoreRequestType, request: Any):
+        """
+        底层发送方法：负责将指令和数据打包，并通过 ZeroMQ 发往 EngineCore 进程。
+        """
+
+        # ---------------------------------------------------------
+        # 1. 生存检查 (Health Check)
+        # ---------------------------------------------------------
+        # 在发送之前，先确认后厨（GPU 进程）还在喘气。
+        # 如果发现后台进程已经挂了（比如 OOM 崩溃），这里会直接抛出异常，防止数据石沉大海。
         self.ensure_alive()
+
+        # ---------------------------------------------------------
+        # 2. 内存回收 (Memory Management)
+        # ---------------------------------------------------------
+        # 这是一个非常精妙的设计。
+        # 检查之前发送的消息中，哪些已经完成了网络传输。
+        # 一旦 ZeroMQ 确认数据发完了，我们就可以安全地释放掉 Python 这边的原始内存。
         self.free_pending_messages()
-        # (Identity, RequestType, SerializedRequest)
+
+        # ---------------------------------------------------------
+        # 3. 消息组装 (Message Construction)
+        # ---------------------------------------------------------
+        # 构造一个 ZeroMQ 多部分消息 (Multipart Message)。
+        # 格式为：(目标标识, 指令类型, *序列化后的数据帧)
+        # self.encoder.encode(request) 可能会返回多个帧（例如：1个元数据帧 + 多个 Tensor 数据帧）。
         msg = (self.core_engine, request_type.value, *self.encoder.encode(request))
 
+        # ---------------------------------------------------------
+        # 4. 零拷贝发送策略 (Zero-copy Strategy)
+        # ---------------------------------------------------------
+        # 如果消息长度 <= 3，说明没有携带额外的辅助缓冲区（即没有大张量、大图片）。
         if len(msg) <= 3:
-            # No auxiliary buffers => no tensor backing buffers in request.
+            # 对于纯指令或短文本，直接发送，不需要复杂的追踪。
+            # copy=False 告诉 ZeroMQ：尽量直接读取这段内存，不要在内存里再复制一份。
             self.input_socket.send_multipart(msg, copy=False)
             return
 
+        # 如果消息很长（包含大量图像数据或 KV Cache 相关的 Tensor）：
+        # 我们开启 track=True 模式。
+        # 这会返回一个 MessageTracker 对象，它能告诉我们“这块大内存什么时候发完”。
         tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
+
+        # ---------------------------------------------------------
+        # 5. 引用计数陷阱防御 (GC Protection)
+        # ---------------------------------------------------------
+        # 【关键】：因为使用了 copy=False（零拷贝），ZeroMQ 只是拿到了内存的地址。
+        # 如果这个函数执行完，Python 的垃圾回收器 (GC) 把 request 对象给删了，
+        # 那块内存就会失效。当 ZeroMQ 真正去读内存发送时，就会读到乱码或者导致程序崩溃。
+        # 
+        # 做法：把 tracker 和 request 对象一起存入“待处理池”。
+        # 只要 tracker.done 还没变成 True，我们就死死抓住这个 request，不让 Python 回收它。
         self.add_pending_message(tracker, request)
 
     def call_utility(self, method: str, *args) -> Any:
@@ -793,9 +904,30 @@ class SyncMPClient(MPClient):
         return self.call_utility("get_supported_tasks")
 
     def add_request(self, request: EngineCoreRequest) -> None:
-        if self.is_dp:
-            self.engines_running = True
-        self._send_input(EngineCoreRequestType.ADD, request)
+            """
+            将一个已经打包好的 EngineCoreRequest 任务正式发送给底层的 GPU 引擎进程。
+            """
+
+            # ---------------------------------------------------------
+            # 1. 数据并行 (DP) 状态维护
+            # ---------------------------------------------------------
+            # 如果开启了数据并行（Data Parallelism），说明我们有多个模型副本在同时工作。
+            if self.is_dp:
+                # 将“引擎运行中”的状态设为 True。
+                # 这通常用于后续的同步逻辑，确保在数据并行模式下，
+                # 所有的副本都能同步地感知到有新任务进入，防止某些节点进入休眠。
+                self.engines_running = True
+
+            # ---------------------------------------------------------
+            # 2. 跨进程发射 (The Actual Send)
+            # ---------------------------------------------------------
+            # 这是最核心的一行代码。
+            # 它调用了内部私有方法 _send_input，其参数非常有讲究：
+            #   - EngineCoreRequestType.ADD: 这是一个枚举值，告诉后厨：“来新活了，把它加进队列！”
+            #   - request: 具体的任务包（包含 Token IDs、采样参数等）。
+            # 
+            # 在 _send_input 内部，它会使用 ZeroMQ 的 input_socket 将数据序列化并发送。
+            self._send_input(EngineCoreRequestType.ADD, request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:

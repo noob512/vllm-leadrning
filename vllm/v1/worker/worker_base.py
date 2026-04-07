@@ -31,9 +31,10 @@ _R = TypeVar("_R")
 
 
 class WorkerBase:
-    """Worker interface that allows vLLM to cleanly separate implementations for
-    different hardware. Also abstracts control plane communication, e.g., to
-    communicate request metadata to other workers.
+    """
+    Worker 接口类。
+    它的核心价值在于：允许 vLLM 干净利落地将不同硬件（GPU、TPU、CPU等）的实现隔离开来。
+    同时，它也抽象了控制面 (Control Plane) 的通信逻辑，比如用来在不同 Worker 之间同步请求的元数据。
     """
 
     def __init__(
@@ -45,40 +46,59 @@ class WorkerBase:
         is_driver_worker: bool = False,
     ) -> None:
         """
-        Initialize common worker components.
+        初始化所有 Worker 都必须具备的基础组件。
 
-        Args:
-            vllm_config: Complete vLLM configuration
-            local_rank: Local device index
-            rank: Global rank in distributed setup
-            distributed_init_method: Distributed initialization method
-            is_driver_worker: Whether this worker handles driver
-                responsibilities
+        参数 (Args):
+            vllm_config: 完整的 vLLM 巨型配置对象。
+            local_rank: 当前节点（物理机）上的设备索引（比如机器上有 8 张卡，这个值就是 0-7）。
+            rank: 全局分布式集群中的唯一标识（比如 2 台 8 卡机，这个值就是 0-15）。
+            distributed_init_method: 底层分布式通信库（通常是 PyTorch 的 nccl_init_method 或 tcp 地址）的初始化方式。
+            is_driver_worker: 身份标识。当前 Worker 是否需要承担“驱动者”的责任（即是否负责汇总结果并和主进程通信）。
         """
+        
+        # ---------------------------------------------------------
+        # 1. 背包整理：将全局大配置拆解为各个子模块配置
+        # ---------------------------------------------------------
+        # 士兵上前线前，需要把背包里的指令、弹药、补给分门别类放好。
         self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.cache_config = vllm_config.cache_config
-        self.lora_config = vllm_config.lora_config
-        self.load_config = vllm_config.load_config
-        self.parallel_config = vllm_config.parallel_config
-        self.scheduler_config = vllm_config.scheduler_config
-        self.device_config = vllm_config.device_config
-        self.speculative_config = vllm_config.speculative_config
-        self.observability_config = vllm_config.observability_config
-        self.kv_transfer_config = vllm_config.kv_transfer_config
-        self.compilation_config = vllm_config.compilation_config
+        self.model_config = vllm_config.model_config               # 模型权重路径、架构、精度等
+        self.cache_config = vllm_config.cache_config               # PagedAttention 的 Block 大小等
+        self.lora_config = vllm_config.lora_config                 # 动态 LoRA 适配器配置
+        self.load_config = vllm_config.load_config                 # 权重下载、加载格式 (safetensors等)
+        self.parallel_config = vllm_config.parallel_config         # TP/PP/EP 分布式并行切分策略
+        self.scheduler_config = vllm_config.scheduler_config       # 调度器最大并发数等
+        self.device_config = vllm_config.device_config             # 硬件设备类型配置
+        self.speculative_config = vllm_config.speculative_config   # 推测解码配置
+        self.observability_config = vllm_config.observability_config # 监控打点配置
+        self.kv_transfer_config = vllm_config.kv_transfer_config   # 跨节点 KV Cache 传输配置
+        self.compilation_config = vllm_config.compilation_config   # Torch Compile 图编译配置
 
+        # ---------------------------------------------------------
+        # 2. 硬件平台探测
+        # ---------------------------------------------------------
+        # 动态导入当前的平台环境（比如探测当前是 NVIDIA 环境、AMD 环境还是 Apple Silicon 环境）
         from vllm.platforms import current_platform
-
         self.current_platform = current_platform
 
+        # ---------------------------------------------------------
+        # 3. 分发身份铭牌 (Dog Tags)
+        # ---------------------------------------------------------
         self.parallel_config.rank = rank
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
+        
+        # 标记是否为“班长” (Driver)
+        # 在张量并行 (TP) 中，所有卡一起算，但只有 Driver Worker 负责把大家算好的结果收集起来，返回给外面的 Scheduler。
         self.is_driver_worker = is_driver_worker
 
-        # Device and model state
+        # ---------------------------------------------------------
+        # 4. 预留“武器”插槽 (Lazy Initialization)
+        # ---------------------------------------------------------
+        # 注意：这里仅仅是占位（赋值为 None）。
+        # 真正的显卡绑定 (device) 和 PyTorch 模型实例化 (model_runner) 
+        # 会留到具体的子类（如 GPUWorker）调用 init_device() 和 load_model() 时才去执行。
+        # 这样做是为了严格防止 CUDA 在多进程 Fork 之前被意外初始化。
         self.device: torch.device | None = None
         self.model_runner: nn.Module | None = None
 
@@ -173,11 +193,13 @@ class WorkerBase:
 
 class WorkerWrapperBase:
     """
-    This class represents one process in an executor/engine. It is responsible
-    for lazily initializing the worker and handling the worker's lifecycle.
-    We first instantiate the WorkerWrapper, which remembers the worker module
-    and class name. Then, when we call `update_environment_variables`, and the
-    real initialization happens in `init_worker`.
+    此类代表执行器 (Executor) / 引擎 (Engine) 中的一个独立进程（通常对应一张 GPU）。
+    它的核心职责是：【延迟初始化 (Lazy Initialization)】工作节点，并管理该节点的生命周期。
+    
+    工作流程设计：
+    1. 首先实例化这个 Wrapper（此时它只记住了目标 Worker 的模块名和类名，但不真正加载 PyTorch 模型）。
+    2. 接着，主进程可以安全地调用 `update_environment_variables` 来设置 CUDA_VISIBLE_DEVICES、NCCL 等环境变量。
+    3. 最后，当环境彻底干净、就绪后，调用 `init_worker` 才真正触发底层 GPU 显存的分配和模型的加载。
     """
 
     def __init__(
@@ -186,20 +208,36 @@ class WorkerWrapperBase:
         global_rank: int | None = None,
     ) -> None:
         """
-        Initialize the worker wrapper with the given vllm_config and rpc_rank.
-        Note: rpc_rank is the rank of the worker in the executor. In most cases,
-        it is also the rank of the worker in the distributed group. However,
-        when multiple executors work together, they can be different.
-        e.g. in the case of SPMD-style offline inference with TP=2,
-        users can launch 2 engines/executors, each with only 1 worker.
-        All workers have rpc_rank=0, but they have different ranks in the TP
-        group.
+        使用给定的 rpc_rank 初始化工作节点包装器。
+        
+        【重要概念区分】：
+        - rpc_rank: 该节点在当前“执行器 (Executor)”管辖范围内的局部编号。
+        - global_rank (隐含在分布式组中): 该节点在整个全局分布式通信组 (如 NCCL) 中的真实编号。
+        
+        在绝大多数标准部署下（比如单机 8 卡启动 1 个 Engine），rpc_rank 和 global_rank 是完全相等的 (0 到 7)。
+        
+        但是，在多引擎协同工作的极端场景下，它们会不同：
+        例如：在 SPMD（单程序多数据）风格的离线推理中，使用 TP=2（两卡张量并行）。
+        用户可能会手动启动 2 个独立的脚本（即 2 个引擎/执行器），每个引擎只管 1 个 Worker。
+        此时：
+        - 对于引擎 A，它的 Worker 的 rpc_rank = 0，但全局 TP rank = 0。
+        - 对于引擎 B，它的 Worker 的 rpc_rank = 0，但全局 TP rank = 1。
         """
+        
+        # 记录局部通信编号（主控进程用这个编号通过 RPC 找它）
         self.rpc_rank: int = rpc_rank
+        
+        # 记录全局拓扑编号（底层的 PyTorch/NCCL 进行 AllReduce 时用这个编号）
+        # 如果没有显式提供 global_rank，默认它等于 rpc_rank
         self.global_rank: int = self.rpc_rank if global_rank is None else global_rank
 
-        # Initialized after init_worker is called
-        self.worker: WorkerBase
+        # 以下两个核心属性在 Wrapper 初始化时是【悬空】的。
+        # 它们只有在后续真正调用了 `init_worker` 方法后才会被赋值。
+        
+        # self.worker: 指向真正干活的底层 PyTorch 实例 (如 GPUWorker)
+        self.worker: WorkerBase 
+        
+        # self.vllm_config: 保存当前引擎的全局配置
         self.vllm_config: VllmConfig
 
     def shutdown(self) -> None:
@@ -213,90 +251,119 @@ class WorkerWrapperBase:
         envs = envs_list[self.rpc_rank]
         update_environment_variables(envs)
 
+    # 使用 instrument 装饰器进行性能分析打点，记录 Worker 初始化耗时
     @instrument(span_name="Worker init")
     def init_worker(self, all_kwargs: list[dict[str, Any]]) -> None:
         """
-        Here we inject some common logic before initializing the worker.
-        Arguments are passed to the worker class constructor.
+        在真正实例化 worker 之前，这里会注入一些通用逻辑。
+        传入的参数 (kwargs) 最终会被传递给真正的 worker 类的构造函数。
         """
+        # ---------------------------------------------------------
+        # 1. 参数提取与配置绑定
+        # ---------------------------------------------------------
+        # all_kwargs 是一个列表，包含了所有 GPU 的配置。
+        # 当前进程只取出属于自己 (rpc_rank) 的那一份参数。
         kwargs = all_kwargs[self.rpc_rank]
 
         vllm_config: VllmConfig | None = kwargs.get("vllm_config")
-        assert vllm_config is not None, (
-            "vllm_config is required to initialize the worker"
-        )
+        assert vllm_config is not None, "初始化 worker 必须提供 vllm_config"
         self.vllm_config = vllm_config
 
+        # 为当前线程开启函数调用追踪（常用于 profiling 性能分析）
         vllm_config.enable_trace_function_call_for_thread()
 
+        # 加载 vLLM 的通用插件（可能包含自定义算子或调度策略）
         from vllm.plugins import load_general_plugins
-
         load_general_plugins()
 
+        # ---------------------------------------------------------
+        # 2. 动态解析 Worker 类 (Dynamic Class Resolution)
+        # ---------------------------------------------------------
+        # vLLM 支持极高自由度的定制，你可以在配置文件里指定用什么 Worker 类。
         parallel_config = vllm_config.parallel_config
+        
         if isinstance(parallel_config.worker_cls, str):
+            # 将字符串路径（如 "vllm.worker.GPUWorker"）通过反射解析为真实的 Python 类。
             worker_class: type[WorkerBase] = resolve_obj_by_qualname(
                 parallel_config.worker_cls
             )
         else:
+            # 安全与规范化约束：不再允许直接传递类对象，必须传全限定名的字符串。
+            # 这是为了防止在多进程/Ray 传输配置时发生序列化 (Pickling) 失败。
             raise ValueError(
-                "passing worker_cls is no longer supported. "
-                "Please pass keep the class in a separate module "
-                "and pass the qualified name of the class as a string."
+                "不再支持直接传递 worker_cls 对象。"
+                "请将该类保存在独立模块中，并以字符串形式传递其全限定名。"
             )
 
+        # ---------------------------------------------------------
+        # 3. 极其强大的“动态混入” (Dynamic Mixin/Inheritance)
+        # ---------------------------------------------------------
+        # 如果用户配置了 Worker 扩展类 (Worker Extension Class)，
+        # vLLM 会在运行时“强行”让原版的 Worker 继承这个扩展类！
         if parallel_config.worker_extension_cls:
             worker_extension_cls = resolve_obj_by_qualname(
                 parallel_config.worker_extension_cls
             )
             extended_calls = []
+            
+            # 如果原版的 worker_class 还没有继承这个扩展类：
             if worker_extension_cls not in worker_class.__bases__:
-                # check any conflicts between worker and worker_extension_cls
+                # 3.1 冲突检查：确保扩展类里没有覆盖/重写原版类的核心方法
                 for attr in dir(worker_extension_cls):
-                    if attr.startswith("__"):
+                    if attr.startswith("__"): # 跳过魔术方法（如 __init__）
                         continue
                     assert not hasattr(worker_class, attr), (
-                        f"Worker class {worker_class} already has an attribute"
-                        f" {attr}, which conflicts with the worker"
-                        f" extension class {worker_extension_cls}."
+                        f"Worker 类 {worker_class} 已经拥有属性 {attr}，"
+                        f"这与扩展类 {worker_extension_cls} 发生了冲突。"
                     )
+                    # 记录被注入的可调用方法（这些方法后续可以被 collective_rpc 调用）
                     if callable(getattr(worker_extension_cls, attr)):
                         extended_calls.append(attr)
-                # dynamically inherit the worker extension class
+                        
+                # 3.2 Python 黑魔法：动态修改类的继承元组 (__bases__)
+                # 这等同于在代码里动态地把 class MyWorker(WorkerBase)
+                # 变成了 class MyWorker(WorkerBase, WorkerExtension)
                 worker_class.__bases__ = worker_class.__bases__ + (
                     worker_extension_cls,
                 )
                 logger.info(
-                    "Injected %s into %s for extended collective_rpc calls %s",
-                    worker_extension_cls,
-                    worker_class,
-                    extended_calls,
+                    "已将 %s 注入到 %s，扩展的 collective_rpc 调用包含: %s",
+                    worker_extension_cls, worker_class, extended_calls,
                 )
 
+        # ---------------------------------------------------------
+        # 4. 多模态与共享内存锁配置
+        # ---------------------------------------------------------
+        # shared_worker_lock 用于在单机多卡 (Multiprocessing) 模式下，
+        # 防止多个进程同时读写多模态输入（如图片、视频）的共享内存 (shm)。
         shared_worker_lock = kwargs.pop("shared_worker_lock", None)
         if shared_worker_lock is None:
             msg = (
-                "Missing `shared_worker_lock` argument from executor. "
-                "This argument is needed for mm_processor_cache_type='shm'."
+                "执行器中缺失 `shared_worker_lock` 参数。"
+                "当 mm_processor_cache_type='shm' (共享内存) 时需要此参数。"
             )
-
             mm_config = vllm_config.model_config.multimodal_config
+            # 如果模型是多模态的且用了共享内存缓存，但没传锁，这是致命错误
             if mm_config and mm_config.mm_processor_cache_type == "shm":
                 raise ValueError(msg)
             else:
                 logger.warning_once(msg)
-
             self.mm_receiver_cache = None
         else:
+            # 从注册表中获取多模态接收器缓存，并绑定锁
             self.mm_receiver_cache = (
                 MULTIMODAL_REGISTRY.worker_receiver_cache_from_config(
-                    vllm_config,
-                    shared_worker_lock,
+                    vllm_config, shared_worker_lock,
                 )
             )
 
+        # ---------------------------------------------------------
+        # 5. 见证奇迹的时刻：真正的实例化
+        # ---------------------------------------------------------
+        # 使用上下文管理器，确保在实例化期间，全局能够访问到当前的 vllm_config。
         with set_current_vllm_config(self.vllm_config):
-            # To make vLLM config available during worker initialization
+            # 将 kwargs 解包，传入我们刚才动态拼装好的 worker_class 构造函数中。
+            # 从这一行代码执行开始，PyTorch/CUDA 的初始化流程才正式打响！
             self.worker = worker_class(**kwargs)
 
     def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:

@@ -83,63 +83,77 @@ HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
-
 class EngineCore:
+
     """Inner loop of vLLM's Engine."""
-
     def __init__(
-        self,
-        vllm_config: VllmConfig,
-        executor_class: type[Executor],
-        log_stats: bool,
-        executor_fail_callback: Callable | None = None,
-        include_finished_set: bool = False,
-    ):
-        # plugins need to be loaded at the engine/scheduler level too
+            self,
+            vllm_config: VllmConfig,
+            executor_class: type[Executor],
+            log_stats: bool,
+            executor_fail_callback: Callable | None = None,
+            include_finished_set: bool = False,
+        ):
+        # ---------------------------------------------------------
+        # 1. 插件与基础配置
+        # ---------------------------------------------------------
+        # 加载可能存在的自定义插件（如自定义的注意力机制或算子）
         from vllm.plugins import load_general_plugins
-
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        # 如果是主节点 (rank_local == 0)，打印初始化日志
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
-                VLLM_VERSION,
-                vllm_config,
+                VLLM_VERSION, vllm_config,
             )
-
         self.log_stats = log_stats
 
-        # Setup Model.
+        # ---------------------------------------------------------
+        # 2. 核心大件之一：实例化模型执行器 (Model Executor)
+        # ---------------------------------------------------------
+        # executor_class 会根据配置实例化对应的执行器（如单卡、NCCL 多卡或 Ray 执行器）。
+        # 这里会在后台真正去实例化 PyTorch 模型并将几十 GB 的权重加载到 GPU 上！
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
         self.available_gpu_memory_for_kv_cache = -1
 
+        # 弹性扩展预处理（处理动态增减显卡节点的情况）
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self._eep_scale_up_before_kv_init()
 
-        # Setup KV Caches and update CacheConfig after profiling.
+        # ---------------------------------------------------------
+        # 3. 核心大件之二：初始化 KV Cache (显存规划)
+        # ---------------------------------------------------------
+        # 【极其重要】：在这里，vLLM 会用“假数据”跑一次前向传播（Profile），
+        # 测试出模型权重到底占了多少显存，然后把剩余的显存全部切分成 PagedAttention 需要的“块 (Blocks)”。
         kv_cache_config = self._initialize_kv_caches(vllm_config)
+        
+        # 结构化输出管理器（用于强制模型按照 JSON Schema 或正则格式输出）
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
-        # Setup scheduler.
+        # ---------------------------------------------------------
+        # 4. 核心大件之三：初始化调度器 (Scheduler)
+        # ---------------------------------------------------------
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
 
-        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
-            # Encoder models without KV cache don't support
-            # chunked prefill. But do SSM models?
+        # 针对无 KV Cache 模型（如仅编码器模型）的特殊处理：禁用分块预填充 (Chunked Prefill)
+        if len(kv_cache_config.kv_cache_groups) == 0:  
             if vllm_config.scheduler_config.enable_chunked_prefill:
                 logger.warning("Disabling chunked prefill for model without KVCache")
                 vllm_config.scheduler_config.enable_chunked_prefill = False
 
+        # 计算调度器的块大小（考虑到可能存在的张量并行和上下文并行）
         scheduler_block_size = (
             vllm_config.cache_config.block_size
             * vllm_config.parallel_config.decode_context_parallel_size
             * vllm_config.parallel_config.prefill_context_parallel_size
         )
 
+        # 正式实例化调度器：它是决定“谁能用显卡、谁要被踢出显卡”的最高指挥官
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
@@ -148,81 +162,76 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
+        
+        # 记录是否开启推测解码 (Speculative Decoding)
         self.use_spec_decode = vllm_config.speculative_config is not None
-        if self.scheduler.connector is not None:  # type: ignore
-            self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+        
+        # ---------------------------------------------------------
+        # 5. 高阶通信与多模态设置
+        # ---------------------------------------------------------
+        # 分离式推理架构 (Disaggregated Serving)：用于跨机器传递 KV Cache
+        if self.scheduler.connector is not None:  
+            self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  
 
+        # 多模态接收器缓存（用于接收图像/视频的 Tensor）
         mm_registry = MULTIMODAL_REGISTRY
-        self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(
-            vllm_config
-        )
+        self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(vllm_config)
 
-        # If a KV connector is initialized for scheduler, we want to collect
-        # handshake metadata from all workers so the connector in the scheduler
-        # will have the full context
+        # 收集各个 Worker 的 KV Connector 握手元数据（用于多机集群）
         kv_connector = self.scheduler.get_kv_connector()
         if kv_connector is not None:
-            # Collect and store KV connector xfer metadata from workers
-            # (after KV cache registration)
-            xfer_handshake_metadata = (
-                self.model_executor.get_kv_connector_handshake_metadata()
-            )
-
+            xfer_handshake_metadata = self.model_executor.get_kv_connector_handshake_metadata()
             if xfer_handshake_metadata:
-                # xfer_handshake_metadata is list of dicts from workers
-                # Each dict already has structure {tp_rank: metadata}
-                # Merge all worker dicts into a single dict
                 content: dict[int, Any] = {}
                 for worker_dict in xfer_handshake_metadata:
                     if worker_dict is not None:
                         content.update(worker_dict)
                 kv_connector.set_xfer_handshake_metadata(content)
 
-        # Setup batch queue for pipeline parallelism.
-        # Batch queue for scheduled batches. This enables us to asynchronously
-        # schedule and execute batches, and is required by pipeline parallelism
-        # to eliminate pipeline bubbles.
+        # ---------------------------------------------------------
+        # 6. 流水线并行与异步计算 (Pipeline Parallelism & Async)
+        # ---------------------------------------------------------
+        # 如果模型被切分到多台机器的先后顺序上（流水线并行），为了不让机器闲着（消除气泡），
+        # 引入异步的 batch_queue。
         self.batch_queue_size = self.model_executor.max_concurrent_batches
-        self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
-        ) = None
+        self.batch_queue: deque | None = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
 
-        self.is_ec_consumer = (
-            vllm_config.ec_transfer_config is None
-            or vllm_config.ec_transfer_config.is_ec_consumer
-        )
+        self.is_ec_consumer = (vllm_config.ec_transfer_config is None
+                            or vllm_config.ec_transfer_config.is_ec_consumer)
         self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
+        # ---------------------------------------------------------
+        # 7. 前缀缓存 (Prefix Caching)
+        # ---------------------------------------------------------
+        # 开启后，系统会为每一个 System Prompt 或长前缀计算 Hash 值。
+        # 下次同样的 Prompt 进来，直接复用显存里的 KV Cache，免去计算。
         self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
         if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
-            caching_hash_fn = get_hash_fn_by_name(
-                vllm_config.cache_config.prefix_caching_hash_algo
-            )
+            caching_hash_fn = get_hash_fn_by_name(vllm_config.cache_config.prefix_caching_hash_algo)
             init_none_hash(caching_hash_fn)
+            self.request_block_hasher = get_request_block_hasher(scheduler_block_size, caching_hash_fn)
 
-            self.request_block_hasher = get_request_block_hasher(
-                scheduler_block_size, caching_hash_fn
-            )
-
-        self.step_fn = (
-            self.step if self.batch_queue is None else self.step_with_batch_queue
-        )
+        # 动态指定单步执行函数（是否有流水线队列）
+        self.step_fn = self.step if self.batch_queue is None else self.step_with_batch_queue
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
-
         self._idle_state_callbacks: list[Callable] = []
 
-        # Mark the startup heap as static so that it's ignored by GC.
-        # Reduces pause times of oldest generation collections.
+        # ---------------------------------------------------------
+        # 8. 极致性能优化 (Python GC 黑科技)
+        # ---------------------------------------------------------
+        # 冻结 Python 垃圾回收器的老生代堆 (Freeze GC Heap)。
+        # 因为在初始化阶段，我们创建了海量的内部对象（如几十万个 KV Block 对象）。
+        # 如果不冻结，Python 的垃圾回收器会定期扫描这些永远不会被释放的对象，
+        # 导致生成 Token 时出现毫秒级的卡顿（Latency Spikes）。冻结后可大幅降低卡顿。
         freeze_gc_heap()
-        # If enable, attach GC debugger after static variable freeze.
         maybe_attach_gc_debug_callback()
-        # Enable environment variable cache (e.g. assume no more
-        # environment variable overrides after this point)
+        
+        # 缓存环境变量，避免运行时高频调用 os.environ（这是慢速系统调用）
         enable_envs_cache()
 
     @instrument(span_name="Prepare model")
@@ -378,34 +387,85 @@ class EngineCore:
         self._iteration_index += 1
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
-        """Schedule, execute, and make output.
-
-        Returns tuple of outputs and a flag indicating whether the model
-        was executed.
+        """
+        核心调度、执行与产出方法。
+        
+        返回值:
+        - outputs: 一个字典，包含各个客户端/请求生成的最新 Token 和状态。
+        - model_executed: 布尔值，表示这次 Step 是否真正在 GPU 上算出了 Token。
         """
 
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
+        # ---------------------------------------------------------
+        # 1. 守门员：空载检查
+        # ---------------------------------------------------------
+        # 如果调度器里连一个处于 unfinished (未完成) 状态的请求都没有，
+        # 直接返回空结果，避免白白调用昂贵的底层函数。
         if not self.scheduler.has_requests():
             return {}, False
+
+        # ---------------------------------------------------------
+        # 2. 调度器 (The Brain): 决定谁上车，并分配显存
+        # ---------------------------------------------------------
+        # 这是 PagedAttention 发挥作用的地方。
+        # schedule() 会遍历等待队列和运行队列，决定：
+        # - 哪些请求可以进入这一批次 (Batch) 进行计算？
+        # - 它们各自的 KV Cache 块 (Blocks) 在显存的物理地址是什么？
+        # 产出 scheduler_output，这是给 GPU 的“施工图纸”。
         scheduler_output = self.scheduler.schedule()
+
+        # ---------------------------------------------------------
+        # 3. 执行器 (The Muscle): 将图纸扔给 GPU 开始前向传播
+        # ---------------------------------------------------------
+        # 将施工图交到底层的 CUDA 算子。
+        # 【关键优化：non_block=True】
+        # 这里是非阻塞调用，它把矩阵乘法任务推入 GPU 流 (CUDA Stream) 后，
+        # 立即返回一个 Future 对象，而不会让 CPU 在这里死等 GPU 算完。
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+
+        # ---------------------------------------------------------
+        # 4. 结构化生成支持 (Grammar Masking) -> 与 GPU 计算并行！
+        # ---------------------------------------------------------
+        # 就在 GPU 轰鸣着计算矩阵的同时，CPU 也没闲着。
+        # 它利用这段时间差，计算那些要求输出 JSON 或正则格式的请求的“语法掩码”。
+        # 把不允许生成的 Token 的概率强制设为 0。
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+
+        # ---------------------------------------------------------
+        # 5. 等待 GPU 交卷 (Blocking & Result Collection)
+        # ---------------------------------------------------------
+        # 使用上下文管理器捕获在等待期间可能发生的任何 CUDA OOM 或计算错误。
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            # CPU 在这里正式挂起，等待 GPU 计算完毕并把 Logits/Tokens 传回内存。
             model_output = future.result()
+            
+            # 某些特定的架构（如完全分离的模型）可能只返回了 Logits 而没采样。
+            # 如果是这种情况，就在这里带着语法掩码进行最终的 Token 采样 (Sampling)。
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
+        # ---------------------------------------------------------
+        # 6. 处理突发事件：取消请求 (Abort Check)
+        # ---------------------------------------------------------
+        # 【防御性编程】：在 GPU 算这几十毫秒的时间里，用户可能按下了网页上的“停止生成”。
+        # 所以在把算出来的 Token 保存之前，必须先检查一下 `aborts_queue`。
+        # 如果有被取消的请求，赶紧把它们的状态标记为废弃，避免浪费资源。
         self._process_aborts_queue()
+
+        # ---------------------------------------------------------
+        # 7. 闭环反馈：更新请求状态与显存
+        # ---------------------------------------------------------
+        # 把刚算出来的新 Token (model_output) 喂回给调度器。调度器会做几件事：
+        # - 把新 Token 拼接到请求的历史序列中。
+        # - 检查这个 Token 是不是 </s> (EOS 结束符)，如果是，标记请求完成，并释放其占用的 KV Cache 显存。
+        # - 组装最终的 engine_core_outputs，准备发给前台。
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
 
+        # 返回结果，并告诉上层这次是否真正调度了 Token 进行计算
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
@@ -1036,81 +1096,117 @@ class EngineCoreProc(EngineCore):
 
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
-        """Launch EngineCore busy loop in background process."""
+        """
+        在后台进程中启动 EngineCore 的忙循环（Busy Loop）。
+        这是子进程真正的入口函数。
+        """
 
-        # Ensure we can serialize transformer config after spawning
+        # ---------------------------------------------------------
+        # 1. 序列化准备
+        # ---------------------------------------------------------
+        # 确保在进程间传输 Transformer 配置时能够正确地按值序列化。
         maybe_register_config_serialize_by_value()
 
         engine_core: EngineCoreProc | None = None
         signal_callback: SignalCallback | None = None
+        
         try:
+            # 2. 基础配置提取
             vllm_config: VllmConfig = kwargs["vllm_config"]
             parallel_config: ParallelConfig = vllm_config.parallel_config
+            
+            # 判断是否处于数据并行 (DP) 模式
             data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
+            
+            # ---------------------------------------------------------
+            # 3. 设置进程身份（在 ps 或 top 命令中可见）
+            # ---------------------------------------------------------
             if data_parallel:
+                # 绑定本地显卡 Rank 索引
                 parallel_config.data_parallel_rank_local = local_dp_rank
                 process_title = f"EngineCore_DP{dp_rank}"
             else:
                 process_title = "EngineCore"
-            set_process_title(process_title)
+            
+            set_process_title(process_title) # 修改进程名，方便系统监控
             maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
-            decorate_logs()
+            decorate_logs() # 装饰日志输出，让日志带上进程身份前缀
 
+            # ---------------------------------------------------------
+            # 4. KV Cache 传输优化配置
+            # ---------------------------------------------------------
+            # 如果开启了跨进程 KV 传输，需要为每个 DP Rank 生成唯一的 Engine ID，防止冲突。
             if data_parallel and vllm_config.kv_transfer_config is not None:
-                # modify the engine_id and append the local_dp_rank to it to ensure
-                # that the kv_transfer_config is unique for each DP rank.
                 vllm_config.kv_transfer_config.engine_id = (
                     f"{vllm_config.kv_transfer_config.engine_id}_dp{local_dp_rank}"
                 )
-                logger.debug(
-                    "Setting kv_transfer_config.engine_id to %s",
-                    vllm_config.kv_transfer_config.engine_id,
-                )
+                logger.debug("将 kv_transfer_config.engine_id 设置为 %s",
+                             vllm_config.kv_transfer_config.engine_id)
 
+            # ---------------------------------------------------------
+            # 5. 实例化真正的推理核心
+            # ---------------------------------------------------------
             parallel_config.data_parallel_index = dp_rank
+            
+            # 场景 A：如果是混合专家模型 (MoE) 且有数据并行，使用特殊的 DPEngineCoreProc。
+            # 这涉及到跨卡的专家协作同步。
             if data_parallel and vllm_config.model_config.is_moe:
-                # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
-                # Non-MoE DP ranks are completely independent, so treat like DP=1.
-                # Note that parallel_config.data_parallel_index will still reflect
-                # the original DP rank.
+                # 场景 B：非 MoE 的 DP Rank 在计算上是独立的，按单副本处理以简化逻辑。
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
+                # 创建标准的引擎核心
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
 
+            # ---------------------------------------------------------
+            # 6. 优雅停机逻辑：信号处理
+            # ---------------------------------------------------------
             def wakeup_engine():
-                # Wakes up idle engine via input_queue when shutdown is requested
-                # Not safe in a signal handler - we may interrupt the main thread
-                # while it is holding the non-reentrant input_queue.mutex
+                """
+                当收到停机请求时，强制唤醒正在休眠等待任务的引擎。
+                """
+                # 向输入队列发送一个 WAKEUP 信号，打破 recv() 的阻塞。
                 engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
+            # 使用 SignalCallback 包装，确保信号处理的线程安全
             signal_callback = SignalCallback(wakeup_engine)
 
             def signal_handler(signum, frame):
+                # 标记状态为“已请求停机”
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
 
+            # 注册系统信号：Ctrl+C (SIGINT) 和 kill (SIGTERM)
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
+            # ---------------------------------------------------------
+            # 7. 激活心脏：进入忙循环
+            # ---------------------------------------------------------
+            # 这是一个阻塞调用，直到引擎关闭。
+            # 它会不停地：监听请求 -> 调度 -> 推理 -> 返回结果。
             engine_core.run_busy_loop()
 
         except SystemExit:
-            logger.debug("EngineCore exiting.")
+            logger.debug("EngineCore 正在正常退出。")
             raise
         except Exception as e:
+            # 8. 灾难通报
             if engine_core is None:
-                logger.exception("EngineCore failed to start.")
+                logger.exception("EngineCore 启动失败。")
             else:
-                logger.exception("EngineCore encountered a fatal error.")
+                logger.exception("EngineCore 遇到致命错误。")
+                # 【关键】：如果自己要死了，一定要给主进程发个“丧信”，防止主进程在那死等。
                 engine_core._send_engine_dead()
             raise e
         finally:
+            # 9. 资源清理
+            # 恢复默认信号处理，停止回调，关闭引擎
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             if signal_callback is not None:
@@ -1134,61 +1230,155 @@ class EngineCoreProc(EngineCore):
         return self.shutdown_state == EngineShutdownState.RUNNING
 
     def run_busy_loop(self):
-        """Core busy loop of the EngineCore."""
+        """
+        EngineCore 的核心忙循环（Busy Loop）。
+        这是 GPU 进程的‘主引擎’，负责协调指令接收与模型推理。
+        """
+        
+        # ---------------------------------------------------------
+        # 循环条件：_handle_shutdown()
+        # ---------------------------------------------------------
+        # 这是一个状态检查函数。它会检查主进程是否发来了关闭信号。
+        # 如果没有停机请求，它返回 True，循环继续；
+        # 一旦检测到停机，它会执行清理逻辑并返回 False，打破循环。
         while self._handle_shutdown():
-            # 1) Poll the input queue until there is work to do.
+            
+            # ---------------------------------------------------------
+            # 1) 处理输入队列 (The Listener)
+            # ---------------------------------------------------------
+            # 这一步是‘听指令’。
+            # 它会检查 ZMQ Socket 或 IPC 队列，看看主进程有没有发来：
+            # - 新的推理请求 (Add Request)
+            # - 取消某个请求 (Abort Request)
+            # - 性能分析指令 (Profile)
+            # 它会将这些请求放入引擎内部的待处理池（Scheduler）中。
             self._process_input_queue()
-            # 2) Step the engine core and return the outputs.
+
+            # ---------------------------------------------------------
+            # 2) 执行推理步进 (The Executor)
+            # ---------------------------------------------------------
+            # 这一步是‘干重活’。
+            # 这是真正的 GPU 计算环节，包含以下核心逻辑：
+            # - 调度 (Scheduler)：决定现在该处理哪些 Token，KV Cache 够不够。
+            # - 执行 (Model Forward)：调用 CUDA 算子进行矩阵乘法。
+            # - 收集结果：拿到生成的 Token ID，并通过 Output Socket 发回给主进程。
+            # 注意：在 LLM 推理中，每执行一次这个 step，通常只产生 1 个新的 Token。
             self._process_engine_step()
 
+        # ---------------------------------------------------------
+        # 退出循环：抛出系统退出异常
+        # ---------------------------------------------------------
+        # 当 _handle_shutdown 返回 False 时，循环结束。
+        # 这里显式抛出 SystemExit，告知操作系统该 Python 进程已完成使命，正常关闭。
         raise SystemExit
 
     def _process_input_queue(self):
-        """Exits when an engine step needs to be performed."""
+        """
+        处理输入队列：当需要执行一个引擎步进（Engine Step）时退出该方法。
+        简单说：这里负责接收‘加任务’或‘停任务’的指令。
+        """
 
         waited = False
+        # ---------------------------------------------------------
+        # 第一阶段：空闲等待循环
+        # 只有在“当前没活干 (not has_work)”且“引擎还在跑 (is_running)”时进入。
+        # ---------------------------------------------------------
         while not self.has_work() and self.is_running():
-            # Notify callbacks waiting for engine to become idle.
+            # 通知那些正在等待引擎变为空闲状态的回调函数（比如性能分析工具）。
             self._notify_idle_state_callbacks()
+
+            # 如果输入队列完全是空的：
             if self.input_queue.empty():
-                # Drain aborts queue; all aborts are also processed via input_queue.
+                # 清空放弃请求队列 (aborts_queue)。
+                # 因为此时引擎已经没有任何任务在跑了，之前积压的“放弃指令”已经没意义了。
                 with self.aborts_queue.mutex:
                     self.aborts_queue.queue.clear()
+                
                 if logger.isEnabledFor(DEBUG):
-                    logger.debug("EngineCore waiting for work.")
+                    logger.debug("EngineCore 正在等待新任务...")
                     waited = True
+
+            # 获取阻塞标志：如果引擎没事干，通常会设为阻塞 (True)，让进程休眠省电。
             block = self.process_input_queue_block
             try:
+                # 【核心】：尝试从队列中获取客户端（主进程）发来的请求。
+                # 如果 block=True，进程会在这里停住，直到主进程发来新消息。
                 req = self.input_queue.get(block=block)
+                
+                # 处理请求（例如：ADD_REQUEST, ABORT_REQUEST 等）。
                 self._handle_client_request(*req)
             except queue.Empty:
+                # 如果是非阻塞模式且队列为空，跳出循环。
                 break
+            
+            # 如果当前是“非阻塞模式”，处理完一个请求就走，不在这里死等。
             if not block:
                 break
 
         if waited:
-            logger.debug("EngineCore loop active.")
+            logger.debug("EngineCore 循环已激活（收到新任务）。")
 
-        # Handle any more client requests.
+        # ---------------------------------------------------------
+        # 第二阶段：快速清空队列 (Drain)
+        # 此时引擎可能有活干（正在生成 Token），我们需要快速把队列里的剩余指令处理完。
+        # ---------------------------------------------------------
         while not self.input_queue.empty():
+            # 使用 non-blocking (get_nowait) 快速把积压的指令全拿出来。
+            # 这是为了防止在计算 Token 的间隙，错过了主进程发来的“取消请求”或“新请求插队”。
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
     def _process_engine_step(self) -> bool:
-        """Called only when there are unfinished local requests."""
+        """
+        仅在有未完成的本地请求时被调用。
+        执行一次推理引擎的“步进 (Step)”。
+        """
 
-        # Step the engine core.
+        # ---------------------------------------------------------
+        # 1. 核心执行 (The Heavy Lifting)
+        # ---------------------------------------------------------
+        # step_fn() 是一个被封装的核心逻辑，它内部主要干了这几件事：
+        #   1. 调度器 (Scheduler) 介入：决定这一步该跑哪些请求（Prefill 还是 Decode）。
+        #   2. 分配显存：为这些请求在 PagedAttention 中分配或锁定 KV Cache 块。
+        #   3. 准备 Tensor：把输入拼成连续的矩阵 (Batching)。
+        #   4. GPU 前向传播 (Forward Pass)：调用 CUDA 算子进行真正的矩阵乘法。
+        #   5. 打包结果：将算出的 Token 封装成对象。
+        # 
+        # 返回值：
+        # - outputs: 生成的结果字典（包含 Token、概率等）。
+        # - model_executed: 布尔值，表示这次 Step 是否真正在 GPU 上跑了模型计算。
         outputs, model_executed = self.step_fn()
-        # Put EngineCoreOutputs into the output queue.
+        
+        # ---------------------------------------------------------
+        # 2. 结果回传 (Return to Sender)
+        # ---------------------------------------------------------
+        # 遍历生成的输出结果。outputs 通常是一个包含多个客户端 ID 和对应结果的字典。
         for output in outputs.items() if outputs else ():
+            # output_queue 是一个 ZMQ 的 PUSH 套接字（或者 multiprocessing.Queue）。
+            # 使用 put_nowait 非阻塞地将算出的 Token 立刻“推”回给主进程（API Server）。
+            # 这样用户就能看到打字机一样的流式输出。
             self.output_queue.put_nowait(output)
-        # Post-step hook.
+            
+        # ---------------------------------------------------------
+        # 3. 步进后清理 (Post-step Hook)
+        # ---------------------------------------------------------
+        # 执行清理和统计工作。比如：
+        # - 释放已经生成完毕（遇到 </s> 停止符）的请求的 KV Cache 显存。
+        # - 更新内部的性能指标（Tokens per second 等）。
         self.post_step(model_executed)
 
-        # If no model execution happened but there are waiting requests
-        # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
-        # background threads (like NIXL handshake) to make progress.
-        # Without this, the tight polling loop can starve background threads.
+        # ---------------------------------------------------------
+        # 4. 防“饿死”机制 (GIL Yielding / Deadlock Prevention)
+        # ---------------------------------------------------------
+        # 【关键设计】：有时候引擎有请求在等，但模型却没有执行计算 (not model_executed)。
+        # 为什么会这样？
+        # 例如，在多机分布式推理中，当前请求可能正在等待从另一台机器传输 KV Cache 过来。
+        # 如果此时继续疯狂执行 while True 的空转循环，
+        # Python 的全局解释器锁 (GIL) 会被这个无限循环死死霸占！
+        # 这会导致负责接收网络数据（如 NIXL 握手）的后台线程被“饿死”，数据永远传不过来，系统死锁。
+        #
+        # 解决方案：强制休眠 1 毫秒 (0.001秒)。
+        # time.sleep 在 Python 底层会主动释放 GIL，让其他后台线程有机会跑一下，接收数据。
         if not model_executed and self.scheduler.has_unfinished_requests():
             time.sleep(0.001)
 
@@ -1238,35 +1428,89 @@ class EngineCoreProc(EngineCore):
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
-        """Dispatch request from client."""
+        """
+        处理客户端（主进程）发来的请求的分发器 (Dispatcher)。
+        根据 request_type 的不同枚举值，执行不同的逻辑。
+        """
 
+        # ---------------------------------------------------------
+        # 1. 唤醒指令 (WAKEUP)
+        # ---------------------------------------------------------
         if request_type == EngineCoreRequestType.WAKEUP:
+            # 这是一个“虚假”的请求，专门用来把引擎从 _process_input_queue 的阻塞休眠中叫醒。
+            # 叫醒后不需要做任何事，所以直接 return。
+            # 通常发生在需要优雅停机 (shutdown) 的时候。
             return
+            
+        # ---------------------------------------------------------
+        # 2. 新增推理请求 (ADD)
+        # ---------------------------------------------------------
         elif request_type == EngineCoreRequestType.ADD:
+            # 解包：拿到具体的请求对象 (req) 和 请求波次 (request_wave，用于 MoE 协调)
             req, request_wave = request
+            
+            # 防御性检查：如果引擎正在关闭中，拒绝接收新任务，并通知主进程失败。
             if self._reject_add_in_shutdown(req):
                 return
+            
+            # 将新请求正式放入引擎的 Scheduler（调度器）中排队等待显存。
             self.add_request(req, request_wave)
+            
+        # ---------------------------------------------------------
+        # 3. 放弃推理请求 (ABORT)
+        # ---------------------------------------------------------
         elif request_type == EngineCoreRequestType.ABORT:
+            # 这里的 request 通常是一个包含 request_id 的列表。
+            # 引擎会立刻在 Scheduler 和正在运行的队列中寻找这些请求，并释放它们占用的显存。
             self.abort_requests(request)
+            
+        # ---------------------------------------------------------
+        # 4. 通用工具调用 (UTILITY)
+        # ---------------------------------------------------------
+        # 这是一个 RPC（远程过程调用）机制。用于执行非计算类的指令，比如：
+        # - 获取性能分析状态 (start_profile / stop_profile)
+        # - 检查引擎是否卡死 (check_health)
         elif request_type == EngineCoreRequestType.UTILITY:
+            # 解包 RPC 调用信息
             client_idx, call_id, method_name, args = request
+            
+            # 防御性检查：如果是关闭状态，拒绝某些调用。
             if self._reject_utility_in_shutdown(client_idx, call_id, method_name):
                 return
+            
             output = UtilityOutput(call_id)
-            # Lazily look-up utility method so that failure will be handled/returned.
+            
+            # 延迟查找执行函数：使用 getattr 动态从 self (EngineCore) 上获取方法并执行。
+            # 这样做可以确保如果 method_name 不存在，抛出的异常能被妥善捕获并返回给主进程，
+            # 而不是让当前 GPU 进程直接崩溃。
             get_result = lambda: (method := getattr(self, method_name)) and method(
+                # 处理基于 msgspec 序列化的参数转换
                 *self._convert_msgspec_args(method, args)
             )
+            
+            # 定义将结果推回主进程的闭包函数（放入 output_queue 发送）
             enqueue_output = lambda out: self.output_queue.put_nowait(
                 (client_idx, EngineCoreOutputs(utility_output=out))
             )
+            
+            # 执行工具方法，并将结果或报错信息放入输出队列。
             self._invoke_utility_method(method_name, get_result, output, enqueue_output)
+            
+        # ---------------------------------------------------------
+        # 5. 执行器崩溃通报 (EXECUTOR_FAILED)
+        # ---------------------------------------------------------
         elif request_type == EngineCoreRequestType.EXECUTOR_FAILED:
+            # 如果是分布式环境，其他 Rank 的底层算子（Executor）如果崩溃了，
+            # 协调器会发这个指令通知当前引擎。
+            # 此时引擎必须立刻抛出异常自杀，防止分布式集群陷入数据不同步的死锁。
             raise RuntimeError("Executor failed.")
+            
+        # ---------------------------------------------------------
+        # 6. 未知指令处理
+        # ---------------------------------------------------------
         else:
             logger.error(
-                "Unrecognized input request type encountered: %s", request_type
+                "遇到无法识别的输入请求类型：%s", request_type
             )
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:

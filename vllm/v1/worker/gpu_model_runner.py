@@ -3761,12 +3761,24 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        """
+        执行模型推理的核心函数
+        
+        Args:
+            scheduler_output: 调度器输出，包含需要执行的请求和相关信息
+            intermediate_tensors: 中间张量（用于管道并行）
+
+        Returns:
+            ModelRunnerOutput: 模型输出，或None（表示需要后续调用sample_tokens）
+        """
+        # 检查执行状态，确保上次调用返回None后才可再次调用
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
 
+        # 如果启用了路由专家，清除捕获器缓冲区
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -3774,9 +3786,8 @@ class GPUModelRunner(
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
 
-        # If ngram_gpu is used, we need to copy the scheduler_output to avoid
-        # the modification has influence on the scheduler_output in engine core process.
-        # The replace is much faster than deepcopy.
+        # 如果使用ngram_gpu，需要复制scheduler_output以避免修改影响引擎核心进程
+        # 使用replace比deepcopy更快
         if (
             self.speculative_config is not None
             and self.speculative_config.use_ngram_gpu()
@@ -3791,19 +3802,24 @@ class GPUModelRunner(
                 scheduled_spec_decode_tokens=spec_decode_tokens_copy,
             )
 
+        # 如果有KV传输组，处理预emption
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        # 获取调度的token总数
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        
+        # 预处理阶段：准备输入数据和状态更新
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
-            self.synchronize_input_prep(),
+            self.synchronize_input_prep(),  # 同步输入准备
         ):
-            # Update persistent batch states.
+            # 更新持久化批次状态
             deferred_state_corrections_fn = self._update_states(scheduler_output)
 
+            # 如果有编码器传输且不是消费者，执行编码器
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
@@ -3812,24 +3828,22 @@ class GPUModelRunner(
                     self._execute_mm_encoder(scheduler_output)
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
+            # 如果没有调度的tokens，直接返回空输出
             if not num_scheduled_tokens:
                 if (
                     self.parallel_config.distributed_executor_backend
                     == "external_launcher"
                     and self.parallel_config.data_parallel_size > 1
                 ):
-                    # this is a corner case when both external launcher
-                    # and DP are enabled, num_scheduled_tokens could be
-                    # 0, and has_unfinished_requests in the outer loop
-                    # returns True. before returning early here we call
-                    # dummy run to ensure coordinate_batch_across_dp
-                    # is called into to avoid out of sync issues.
+                    # 特殊情况：当外部启动器和DP同时启用时，num_scheduled_tokens可能为0
+                    # 调用dummy run确保coordinate_batch_across_dp被调用，避免同步问题
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
-                    # Return empty ModelRunnerOutput if no work to do.
+                    # 没有工作要做时返回空的ModelRunnerOutput
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
+            # 检查KV共享快速预填充配置
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
                     "--kv-sharing-fast-prefill produces incorrect "
@@ -3837,28 +3851,33 @@ class GPUModelRunner(
                     "it when the requests need prompt logprobs"
                 )
 
-            num_reqs = self.input_batch.num_reqs
-            req_ids = self.input_batch.req_ids
+            # 获取请求相关信息
+            num_reqs = self.input_batch.num_reqs  # 请求数量
+            req_ids = self.input_batch.req_ids     # 请求ID列表
+            # 每个请求的调度token数
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-            num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
-            max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)  # numpy数组形式
+            max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())  # 最大调度token数
+            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens  # 未填充的token总数
 
+            # 准备模型输入
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
 
+            # 计算级联注意力前缀长度（如果启用）
             cascade_attn_prefix_lens = None
-            # Disable cascade attention when using microbatching (DBO)
+            # 当使用微批处理(DBO)时不启用级联注意力
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
-                # Pre-compute cascade attention prefix lengths
+                # 预计算级联注意力前缀长度
                 cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                     num_scheduled_tokens_np,
                     self.input_batch.num_computed_tokens_cpu[:num_reqs],
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            # 确定批处理执行模式和填充方式
             (
                 cudagraph_mode,
                 batch_desc,
@@ -3874,6 +3893,7 @@ class GPUModelRunner(
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
+            # 记录调试信息
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
                 "should_ubatch: %s, num_tokens_across_dp: %s",
@@ -3883,10 +3903,13 @@ class GPUModelRunner(
                 num_tokens_across_dp,
             )
 
+            # 计算填充后的token和请求数量
             num_tokens_padded = batch_desc.num_tokens
             num_reqs_padded = (
                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             )
+            
+            # 创建微批处理切片
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
                 num_scheduled_tokens_np,
@@ -3901,9 +3924,8 @@ class GPUModelRunner(
                 ubatch_slices_padded,
             )
 
-            # True if any attention backend handles KV cache update separately
-            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,
-            # slot_mappings must use padded dimensions to match the key/value tensors.
+            # 检查注意力后端是否单独处理KV缓存更新
+            # 如果forward_includes_kv_cache_update为False，则slot_mappings必须使用填充维度
             has_separate_kv_update = not all(
                 all(
                     g.backend.forward_includes_kv_cache_update
@@ -3914,10 +3936,10 @@ class GPUModelRunner(
             )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+            # 如果使用Mamba缓存对齐模式，需要特殊预处理
             if self.cache_config.mamba_cache_mode == "align":
-                # preprocess_mamba reads req_state.num_computed_tokens (CPU)
-                # to decide copy operations, so we must apply deferred
-                # corrections before it runs.
+                # preprocess_mamba读取req_state.num_computed_tokens(CPU)来决定复制操作
+                # 因此必须在它运行之前应用延迟的状态修正
                 if deferred_state_corrections_fn:
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
@@ -3932,18 +3954,19 @@ class GPUModelRunner(
                     self.model.get_mamba_state_copy_func(),
                     self._get_mamba_copy_bufs(),
                 )
-                # preprocess_mamba resets num_accepted_tokens_cpu to 1
-                # for requests whose state was copied to a new block.
-                # Re-sync to GPU so the mamba kernel reads from the
-                # correct initial state slot (init_token_idx = 0).
+                # preprocess_mamba将num_accepted_tokens_cpu重置为1
+                # 对于状态复制到新块的请求。重新同步到GPU，使mamba内核从正确初始状态槽读取
                 self.num_accepted_tokens.np[:num_reqs] = (
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
+            # 检查是否使用推测解码
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            # 对于注意力计算，使用填充的切片
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            # 获取槽位映射
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -3955,6 +3978,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
+            # 构建注意力元数据
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -3971,6 +3995,7 @@ class GPUModelRunner(
                 )
             )
 
+            # 预处理输入数据
             (
                 input_ids,
                 inputs_embeds,
@@ -3982,28 +4007,26 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
+        # 如果需要计算KV缩放因子，设置CUDA图模式为无
+        # KV缩放计算涉及动态操作，与CUDA图捕获不兼容
         if self.calculate_kv_scales:
             cudagraph_mode = CUDAGraphMode.NONE
-            # Mark KV scales as calculated after the first forward pass
+            # 在第一次前向传播后标记KV缩放已计算
             self.calculate_kv_scales = False
 
-        # Encoder-decoder models can only compile the pure decode steps where no
-        # encoder inputs are present. Use eager for the first pass.
+        # 编码器-解码器模型只能编译纯解码步骤（没有编码器输入）
+        # 第一次传递使用eager模式
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        # Run the model.
-        # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, defer connector finalization
-        # (wait_for_save + clear metadata) until after draft model runs.
+        # 执行模型前向传播
+        # 使用持久化缓冲区进行CUDA图
+        # 当启用推测解码时，延迟连接器最终化（等待save + 清除元数据）直到草稿模型运行后
         defer_kv_connector_finalize = self.speculative_config is not None
         with (
-            set_forward_context(
+            set_forward_context(  # 设置前向传播上下文
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
@@ -4014,12 +4037,13 @@ class GPUModelRunner(
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
             ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
+            record_function_or_nullcontext("gpu_model_runner: forward"),  # 记录前向传播时间
             self.maybe_get_kv_connector_output(
                 scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
+                defer_finalize=defer_kv_connector_finalize,  # 延迟最终化
             ) as kv_connector_output,
         ):
+            # 执行模型前向传播
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4028,26 +4052,29 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        # 后处理阶段
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            # 处理隐藏状态输出
             if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
+                # 当使用EAGLE 3时为True
                 hidden_states, aux_hidden_states = model_output
             else:
-                # Common case.
+                # 常见情况
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            # 如果不需要PP广播输出
             if not self.broadcast_pp_output:
-                # Common case.
+                # 常见情况
                 if not get_pp_group().is_last_rank:
-                    # Return the intermediate tensors.
+                    # 返回中间张量
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
 
+                # 如果是池化模型，返回池化输出
                 if self.is_pooling_model:
-                    # Return the pooling output.
                     return self._pool(
                         hidden_states,
                         num_scheduled_tokens,
@@ -4055,14 +4082,17 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                # 提取用于计算logits的隐藏状态
                 sample_hidden_states = hidden_states[logits_indices]
+                # 计算logits
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
-                # Rare case.
+                # 罕见情况：需要在PP中广播输出
                 assert not self.is_pooling_model
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
+                    # 不是最后的PP等级，发送张量字典
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
                             self.vllm_config, num_tokens_padded
@@ -4075,39 +4105,43 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    # 最后的PP等级，计算logits
                     logits = self.model.compute_logits(sample_hidden_states)
 
+                # 准备广播的数据
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
                     model_output_broadcast_data["logits"] = logits.contiguous()
 
+                # 广播logits到所有PP等级
                 broadcasted = get_pp_group().broadcast_tensor_dict(
                     model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        # 保存执行状态
         self.execute_model_state = ExecuteModelState(
-            scheduler_output,
-            logits,
-            spec_decode_metadata,
-            spec_decode_common_attn_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            ec_connector_output,
-            cudagraph_stats,
-            slot_mappings,
+            scheduler_output,                      # 调度器输出
+            logits,                               # 计算的logits
+            spec_decode_metadata,                 # 推测解码元数据
+            spec_decode_common_attn_metadata,     # 推测解码共同注意力元数据
+            hidden_states,                        # 隐藏状态
+            sample_hidden_states,                 # 采样隐藏状态
+            aux_hidden_states,                    # 辅助隐藏状态
+            ec_connector_output,                  # 编码器连接器输出
+            cudagraph_stats,                      # CUDA图统计
+            slot_mappings,                        # 槽位映射
         )
         self.kv_connector_output = kv_connector_output
 
-        # Now the batch has been launched we can wait for corrections from the
-        # previous model forward without breaking async scheduling.
+        # 批次已启动，现在可以等待来自上一个模型前向传播的延迟修正
+        # 而不会破坏异步调度
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        # 返回None表示需要后续调用sample_tokens
         return None
-
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
