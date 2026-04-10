@@ -1724,24 +1724,62 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        """
+        将请求正式加入调度器。
+        支持两种模式：全新的请求，以及对已有请求的流式内容追加。
+        """
+        
+        # ---------------------------------------------------------
+        # 终极登记册查询：这个请求 ID 之前来过吗？
+        # ---------------------------------------------------------
         existing = self.requests.get(request.request_id)
+        
+        # =========================================================
+        # 场景 A：老顾客追加订单 (处理 Streaming Input)
+        # =========================================================
         if existing is not None:
+            # 走到这里，说明用户传了一个已经存在于系统中的 request_id。
+            # 这是 vLLM 针对“流式输入”或“多轮对话不断追加长文本”的高级特性。
+            
+            # 将新传来的 request 解析为一段“更新包 (Update Chunk)”
             update = StreamingUpdate.from_request(request)
+            
+            # 分支 A-1：引擎正在处理这个任务，或者它还在大队列里正常排队
             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+                # 防御性检查：既然你要追加数据，你第一次来的时候必须声明过你是支持追加的(resumable)。
+                # 否则说明系统里出现了两个毫不相干却碰巧重名的 request_id，直接报错。
                 assert existing.streaming_queue is not None, "duplicate request id"
-                # Queue next input chunk (or finished sentinel).
+                
+                # 把这段新的数据包（或者代表结束的哨兵信号）塞进这个请求【专属的私人背包】里。
+                # 等 GPU 算完当前块，会自己从这个小背包里拿下一块接着算。
                 existing.streaming_queue.append(update)
+                
+            # 分支 A-2：引擎算完了上一段，正在眼巴巴地专门等你的下一段数据
             elif update is not None:
-                # Commence next input chunk.
+                # 直接唤醒这个会话，把新的数据块喂给它，让它继续进 GPU 算。
                 self._update_request_as_session(existing, update)
+                
+            # 分支 A-3：引擎在等你，但你发来了一个空的 update（客户端表示“我说完了”）
             else:
-                # Streaming-input session finished.
+                # 结束这个流式输入会话，打上终止标记，准备清理显存。
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+                
+        # =========================================================
+        # 场景 B：纯萌新，新顾客首次点单
+        # =========================================================
         else:
+            # 如果请求明确声明自己后续还会追加数据（比如长语音边录边转文字，或无限长文本流）
             if request.resumable:
+                # 提前给它发一个“私人小背包”，专门用来装后续发来的追加碎片
                 request.streaming_queue = deque()
+                
+            # 1. 把任务挂到大堂的墙上（加入全局等待队列 Waiting Queue）
             self._enqueue_waiting_request(request)
+            
+            # 2. 把任务记录到大堂经理的生死簿上（全局 requests 字典，用来防重和快速查找）
             self.requests[request.request_id] = request
+            
+            # 3. 性能打点：记录这个任务是几分几秒正式开始排队的
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 

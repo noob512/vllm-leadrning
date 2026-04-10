@@ -827,15 +827,48 @@ class SyncMPClient(MPClient):
         self.resources.output_socket = None
 
     def get_output(self) -> EngineCoreOutputs:
-        # If an exception arises in process_outputs_socket task,
-        # it is forwarded to the outputs_queue so we can raise it
-        # from this (run_output_handler) task to shut down the server.
+        """
+        从底层的计算/输出线程获取最新一次前向传播（Forward Pass）的结果。
+        这是一个阻塞调用（Blocking Call），如果 GPU 还没算完，主线程会在这里死等。
+        """
+
+        # ---------------------------------------------------------
+        # 1. 提货：从线程安全队列中获取结果 (Queue.get)
+        # ---------------------------------------------------------
+        # 还记得 EngineCoreProc 里的 output_thread 吗？
+        # 当底层的 Worker (GPU) 算完后，后台的 process_outputs_socket 任务会把结果打包，
+        # 并塞进这个 outputs_queue 队列里。
+        # 主线程执行到这里时，如果队列为空，它就会原地挂起（休眠），直到新货上架。
         outputs = self.outputs_queue.get()
 
+        # ---------------------------------------------------------
+        # 2. 死亡信使：处理后台线程抛出的“毒药” (Poison Pill)
+        # ---------------------------------------------------------
+        # 【多线程黑科技】：在 Python 里，如果一个后台子线程崩溃了（比如 Socket 断开），
+        # 它的报错信息只会打印在控制台，主线程是捕捉不到的，会导致主线程无限死等（死锁）。
+        # 【解决办法】：后台线程如果 catch 到了异常，它不直接抛出，
+        # 而是把 Exception 对象当成“正常的货物”塞进 outputs_queue 传给主线程。
+        # 这里主线程打开包裹一看：“卧槽，是个炸弹（Exception）！”
         if isinstance(outputs, Exception):
+            # _format_exception 会把底层的错误栈清理干净，
+            # 然后在主线程里把这个炸弹引爆（raise），从而优雅且安全地触发整个服务器的停机。
+            # 'from None' 的作用是隐藏掉 raise 动作本身的无用堆栈，让报错信息更干净。
             raise self._format_exception(outputs) from None
-        if outputs.wave_complete is not None:
+
+        # ---------------------------------------------------------
+        # 3. 波次同步控制 (Wave Coordination for MoE)
+        # ---------------------------------------------------------
+        # 这是一个针对复杂架构（如 Mixture of Experts, MoE 或多阶段计算）的特殊标记。
+        # 在某些模式下，一次计算可能分为多个连续的“波次 (Wave)”。
+        # 如果底层报告 wave_complete（这一波彻底算完了），
+        # 就重置 engines_running 状态，告知调度器可以安排下一轮全新的调兵遣将了。
+        if hasattr(outputs, "wave_complete") and outputs.wave_complete is not None:
             self.engines_running = False
+
+        # ---------------------------------------------------------
+        # 4. 成功交接
+        # ---------------------------------------------------------
+        # 提货成功，把带有 Token IDs 和性能统计的 EngineCoreOutputs 交给大堂经理。
         return outputs
 
     def _send_input(self, request_type: EngineCoreRequestType, request: Any):

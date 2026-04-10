@@ -484,29 +484,57 @@ class MsgpackDecoder:
 
 
 def run_method(
-    obj: Any,
-    method: str | bytes | Callable,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
+    obj: Any,                    # 目标对象，通常是底层的 GPU Worker (大厨)
+    method: str | bytes | Callable, # 要执行的方法（支持三种截然不同的形态）
+    args: tuple[Any, ...],       # 位置参数（比如施工图纸）
+    kwargs: dict[str, Any],      # 关键字参数
 ) -> Any:
     """
-    Run a method of an object with the given arguments and keyword arguments.
-    If the method is string, it will be converted to a method using getattr.
-    If the method is serialized bytes and will be deserialized using
-    cloudpickle.
-    If the method is a callable, it will be called directly.
+    通用方法执行器。
+    它的核心作用是：抹平“本地调用”与“跨进程/跨机器 RPC 调用”在函数传递形式上的差异。
     """
+    
+    # ---------------------------------------------------------
+    # 形态 1：跨机器黑魔法 —— 二进制序列化 (Bytes)
+    # ---------------------------------------------------------
+    # 场景：在 Ray 这样的多机集群中，主节点可能想让 GPU 节点执行一个它自己临时写的 Lambda 匿名函数。
+    # 字符串传不过去，因为远程节点代码里没这个函数。
     if isinstance(method, bytes):
+        # cloudpickle 是 Python 序列化界的神器（比自带的 pickle 强大得多）。
+        # 它能把一段运行中的代码（哪怕是匿名函数、闭包）直接打包成二进制发过网络。
+        # 这里先解码还原出函数，然后用 partial 将 obj（大厨）强行绑定为该函数的第一个参数（即 self）。
         func = partial(cloudpickle.loads(method), obj)
+        
+    # ---------------------------------------------------------
+    # 形态 2：最常见的标准调用 —— 字符串方法名 (String)
+    # ---------------------------------------------------------
+    # 场景：大堂经理喊了一句 "execute_model"（这也是 vLLM 最常用的方式）。
     elif isinstance(method, str):
         try:
+            # 利用 Python 的动态特性（反射），直接从 obj 身上把这个名字对应的方法揪出来。
+            # 这等同于 func = obj.execute_model
             func = getattr(obj, method)
         except AttributeError:
+            # 防御性编程：如果传错名字，或者底层 Worker 没实现这个方法，抛出标准异常。
+            # 使用 `from None` 是为了屏蔽内部杂乱的报错堆栈，给上层一个清晰的 NotImplementedError。
             raise NotImplementedError(
                 f"Method {method!r} is not implemented."
             ) from None
+            
+    # ---------------------------------------------------------
+    # 形态 3：本地同进程调用 —— 原生函数对象 (Callable)
+    # ---------------------------------------------------------
+    # 场景：单机模式下，或者开发者写的一些本地 hook 测试，直接把函数本体传过来了。
     else:
+        # 同样使用 partial，将 obj 作为第一个参数 (self) 喂给这个外部函数。
         func = partial(method, obj)  # type: ignore
+
+    # ---------------------------------------------------------
+    # 终极一击：开火执行
+    # ---------------------------------------------------------
+    # 无论上面经过了多么复杂的解码和绑定，到这里，
+    # func 已经变成了一个绝对安全、直接可调用的对象。
+    # 挂上大堂经理送来的各种参数 (*args, **kwargs)，正式执行！
     return func(*args, **kwargs)
 
 

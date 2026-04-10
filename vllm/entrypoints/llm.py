@@ -2059,14 +2059,20 @@ class LLM:
 
     def _run_engine(
         self,
-        output_type: type[_O] | tuple[type[_O], ...],
+        output_type: type[_O] | tuple[type[_O], ...], # 期望返回的对象类型（如 RequestOutput）
         *,
-        use_tqdm: bool | Callable[..., tqdm] = True,
+        use_tqdm: bool | Callable[..., tqdm] = True,  # 进度条配置
     ) -> list[_O]:
-        # Initialize tqdm.
+        
+        # ---------------------------------------------------------
+        # 1. 进度条初始化 (UI 层)
+        # ---------------------------------------------------------
         if use_tqdm:
+            # 去底层问一下大堂经理：现在队列里总共有多少个任务？
             num_requests = self.llm_engine.get_num_unfinished_requests()
             tqdm_func = use_tqdm if callable(use_tqdm) else tqdm
+            
+            # 初始化一个进度条，不仅显示进度，还会动态显示 input/output 的吞吐速度
             pbar = tqdm_func(
                 total=num_requests,
                 desc="Processed prompts",
@@ -2074,42 +2080,84 @@ class LLM:
                 postfix=(f"est. speed input: {0:.2f} toks/s, output: {0:.2f} toks/s"),
             )
 
-        # Run the engine.
-        outputs: list[_O] = []
-        total_in_toks = 0
-        total_out_toks = 0
+        # ---------------------------------------------------------
+        # 2. 核心大循环 (The Core Busy Loop)
+        # ---------------------------------------------------------
+        outputs: list[_O] = []  # 终点站：存放【彻底生成完毕】的请求结果
+        total_in_toks = 0       # 统计总共处理了多少个 Prompt Token（用于算速度）
+        total_out_toks = 0      # 统计总共生成了多少个 Output Token（用于算速度）
+        
+        # 只要引擎里（包括 waiting, running, swapped 队列）还有没处理完的请求，循环就不停止
         while self.llm_engine.has_unfinished_requests():
+            
+            # 【全场最核心的一行代码！！！】
+            # 调用底层引擎走一步（Step）。
+            # 这一步包含了：调度器挑任务 -> 准备显存 -> 调用 GPU 跑一次前向传播 -> 吐出 1 个 Token。
+            # 返回的 step_outputs 包含了【当前正在跑的】请求的最新状态。
             step_outputs = self.llm_engine.step()
+            
+            # 遍历 GPU 刚刚吐出来的最新状态
             for output in step_outputs:
                 assert isinstance(output, output_type)
+                
+                # ---------------------------------------------------------
+                # 3. 判停与收集 (Check & Collect)
+                # ---------------------------------------------------------
+                # 【关键逻辑】：step() 会返回很多请求的状态，但我们只关心那些【彻底跑完】的。
+                # 没跑完的（比如还要继续吐下一个字的），就在引擎底层待着，我们不管。
                 if output.finished:
+                    # 这桌客人吃完了（遇到了 <EOS> 停止符，或者达到了最大长度限制）
+                    # 把它的最终结果收集到 outputs 列表里
                     outputs.append(output)  # type: ignore[arg-type]
+                    
+                    # ---------------------------------------------------------
+                    # 4. 吞吐量测算 (Performance Profiling)
+                    # ---------------------------------------------------------
+                    # 下面这一大块全是在算：这一个请求跑完后，我们整体的吞吐速度是多少？
                     if use_tqdm:
                         if isinstance(output, RequestOutput):
-                            # Calculate tokens only for RequestOutput
-                            n = len(output.outputs)
+                            # 计算这个请求包含的选项数 (比如 n=3 表示让模型对同一个 prompt 生成 3 个不同的回答)
+                            n = len(output.outputs) 
+                            
                             assert output.prompt_token_ids is not None
+                            # 累加输入的 Prompt Token 数量
                             total_in_toks += len(output.prompt_token_ids) * n
+                            # 计算输入吞吐量 (Prompt Tokens / 耗时)
                             in_spd = total_in_toks / pbar.format_dict["elapsed"]
+                            
+                            # 累加模型生成的 Token 数量
                             total_out_toks += sum(
                                 len(stp.token_ids) for stp in output.outputs
                             )
+                            # 计算输出吞吐量 (Generated Tokens / 耗时)
                             out_spd = total_out_toks / pbar.format_dict["elapsed"]
+                            
+                            # 把实时速度打在进度条的尾巴上
                             pbar.postfix = (
                                 f"est. speed input: {in_spd:.2f} toks/s, "
                                 f"output: {out_spd:.2f} toks/s"
                             )
+                            # 进度条往前推 n 格
                             pbar.update(n)
                         else:
                             pbar.update(1)
+                        
+                        # 强制刷新进度条显示
                         if pbar.n == num_requests:
                             pbar.refresh()
 
+        # ---------------------------------------------------------
+        # 5. 清场与乱序重排 (Cleanup & Sorting)
+        # ---------------------------------------------------------
         if use_tqdm:
             pbar.close()
-        # Sort the outputs by request ID.
-        # This is necessary because some requests may be finished earlier than
-        # its previous requests.
+            
+        # 【为什么最后要排序？】
+        # 因为 vLLM 是异步的！
+        # 假设你输入了两个请求：[Prompt A (需生成100字), Prompt B (需生成5字)]
+        # 虽然 A 先进队列，但 B 生成 5 个字就结束了，B 会先被 append 到 outputs 里。
+        # 如果不排序直接返回，用户收到的结果顺序就和输入的 prompt 顺序错乱了。
+        # 所以必须按照最初赋予的 request_id 强行重新排一次序，保证“原样进，原样出”。
         return sorted(outputs, key=lambda x: int(x.request_id))
 
     def init_weight_transfer_engine(

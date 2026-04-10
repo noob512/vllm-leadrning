@@ -300,36 +300,69 @@ class EngineCore:
         return self.model_executor.supported_tasks
 
     def add_request(self, request: Request, request_wave: int = 0):
-        """Add request to the scheduler.
-
-        `request_wave`: indicate which wave of requests this is expected to
-        belong to in DP case
         """
-        # Validate the request_id type.
+        将经过反序列化和预处理的请求，正式添加到底层调度器中。
+        
+        参数解析：
+        - request: 包含 Token ID、生成参数等所有核心信息的请求对象。
+        - request_wave: 这是一个针对数据并行 (DP) 或 混合专家模型 (MoE) 的高级参数。
+          在大规模分布式推理中，任务可能是一波一波 (wave) 到来的，这个参数用来对齐不同卡上的波次。
+        """
+        
+        # ---------------------------------------------------------
+        # 1. 最基础的身份校验
+        # ---------------------------------------------------------
+        # 确保订单号必须是字符串类型。
+        # 分布式系统里，ID 的类型不一致会导致非常隐蔽的 Hash 查找失败或内存泄漏Bug。
         if not isinstance(request.request_id, str):
             raise TypeError(
                 f"request_id must be a string, got {type(request.request_id)}"
             )
 
+        # ---------------------------------------------------------
+        # 2. 判别“非生成类”任务 (Pooling Tasks Validations)
+        # ---------------------------------------------------------
+        # 大模型不光能“生成文本 (Generation)”，还能用来提取“向量特征 (Embedding)” 
+        # 或进行“文本分类 (Classification)”。这些统称为 Pooling（池化）任务。
         if pooling_params := request.pooling_params:
+            # 去系统里查一下：当前挂载的模型，到底支不支持用户想要的池化任务？
+            # 比如，你加载了一个纯对话的 Llama 3 模型，用户却非要提取 Embedding 向量，这就属于不支持。
             supported_pooling_tasks = [
                 task for task in self.get_supported_tasks() if task in POOLING_TASKS
             ]
 
+            # 如果不支持，立刻打回，拒绝接单，防止 GPU 跑到一半报错崩溃。
             if pooling_params.task not in supported_pooling_tasks:
                 raise ValueError(
                     f"Unsupported task: {pooling_params.task!r} "
                     f"Supported tasks: {supported_pooling_tasks}"
                 )
 
+        # ---------------------------------------------------------
+        # 3. 前沿架构校验：KV Cache 分离架构 (KV Transfer Validation)
+        # ---------------------------------------------------------
+        # 【黑科技预警】：KV Transfer（KV 缓存转移）是 vLLM 非常前沿的功能。
+        # 在极致优化的超大集群中，我们会把“阅读长文本 (Prefill)”和“逐字生成 (Decode)”拆到不同的机器上跑。
+        # 此时，Prefill 机器算完的 KV Cache，需要通过网络直接传给 Decode 机器。
+        # 这就需要用到 kv_transfer_params 和底层的 KVConnector 组件。
         if request.kv_transfer_params is not None and (
             not self.scheduler.get_kv_connector()
         ):
+            # 如果用户传了 KV 转移参数，但当前这台机器根本没开启这个功能组件：
+            # 这里不报错，只是发个警告，并默默把这个高级参数忽略掉（降级为普通单机运算）。
             logger.warning(
                 "Got kv_transfer_params, but no KVConnector found. "
                 "Disabling KVTransfer for this request."
             )
 
+        # ---------------------------------------------------------
+        # 4. 终极一跃：推入调度器
+        # ---------------------------------------------------------
+        # 所有的安检全部通过！
+        # 这个任务被正式交给了 Scheduler（调度器）。
+        # 调度器会立刻把它塞进 `waiting`（等待区）队列中。
+        # 在下一次 `_process_engine_step()`（主厨开火）时，调度器就会根据显存容量，
+        # 决定要不要把它捞出来丢进 GPU。
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -836,8 +869,12 @@ class EngineShutdownState(IntEnum):
 
 
 class EngineCoreProc(EngineCore):
-    """ZMQ-wrapper for running EngineCore in background process."""
+    """
+    EngineCore 的 ZMQ 包装类，负责在后台进程中运行推理引擎。
+    它不仅持有模型，还持有负责与主进程通信的 ZMQ 套接字。
+    """
 
+    # 当引擎崩溃时发送的特殊字节码
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
     addresses: EngineZmqAddresses
 
@@ -854,23 +891,32 @@ class EngineCoreProc(EngineCore):
         *,
         engine_index: int = 0,
     ):
+        # 1. 【核心缓冲区】：建立内部队列
+        # input_queue: 存放从主进程/协调器收到的请求
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
+        # output_queue: 存放 GPU 算完、准备发回给主进程的结果
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+
+        # 如果 Executor（执行器）崩了，立刻往输入队列塞一个失败信号，触发自杀逻辑
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
         )
 
         self.engine_index = engine_index
+        # 身份标识：将 index 转为 2 字节的小端序，用于 ZMQ 路由识别
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
 
-        # Receiver for tensor IPC
-        self.tensor_ipc_receiver: TensorIpcReceiver | None = None
+        # 2. 【多模态零拷贝】：设置张量 IPC 接收器
+        self.tensor_ipc_receiver = None
         if tensor_queue is not None:
+            # 如果有共享内存队列，专门启动一个接收器处理大图/视频张量
             self.tensor_ipc_receiver = TensorIpcReceiver(tensor_queue)
             logger.info("Using tensor IPC queue for multimodal tensor sharing")
 
+        # 3. 【建立联系】：执行启动握手
+        # 这里会阻塞，直到通过 handshake_address 拿到该引擎专属的 ZMQ 通信地址
         with self._perform_handshakes(
             handshake_address,
             identity,
@@ -878,33 +924,36 @@ class EngineCoreProc(EngineCore):
             vllm_config,
             client_handshake_address,
         ) as addresses:
-            # Set up data parallel environment.
+            
+            # 判断是否存在数据并行协调器（DP Coordinator）
             self.has_coordinator = addresses.coordinator_output is not None
             self.frontend_stats_publish_address = (
                 addresses.frontend_stats_publish_address
             )
-            logger.debug(
-                "Has DP Coordinator: %s, stats publish address: %s",
-                self.has_coordinator,
-                self.frontend_stats_publish_address,
-            )
+            
+            # 是否由内部协调器负责负载均衡（LB）
             internal_dp_balancing = (
                 self.has_coordinator
                 and not vllm_config.parallel_config.data_parallel_external_lb
             )
-            # Only publish request queue stats to coordinator for "internal"
-            # and "hybrid" LB modes.
+            # 只有在内部或混合负载均衡模式下，才向协调器上报自己的队列长度
             self.publish_dp_lb_stats = internal_dp_balancing
 
             self.addresses = addresses
             self.process_input_queue_block = True
+            
+            # 如果是弹性并行扩展（MoE 动态加卡），先发个通知说我准备好了
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
                 self._eep_send_engine_core_notification(
                     EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
                     vllm_config=vllm_config,
                 )
+            
+            # 初始化分布式环境（如 NCCL 等）
             self._init_data_parallel(vllm_config)
 
+            # 4. 【正式变身】：调用父类 EngineCore 初始化模型
+            # 这一步会触发加载权重、初始化显存块等极耗时的重体力活
             super().__init__(
                 vllm_config,
                 executor_class,
@@ -913,12 +962,12 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
-            # Background Threads and Queues for IO. These enable us to
-            # overlap ZMQ socket IO with GPU since they release the GIL,
-            # and to overlap some serialization/deserialization with the
-            # model forward pass.
-            # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
+            # 5. 【后台流水线】：开启 I/O 线程
+            # 作用：由于 ZMQ 处理和序列化会占用 CPU，开启独立线程可以实现：
+            #      GPU 算当前 batch 时，CPU 在反序列化下一个请求。
             ready_event = threading.Event()
+            
+            # 线程 A：输入线程。负责从 ZMQ 读取 Request，反序列化后塞进 self.input_queue
             input_thread = threading.Thread(
                 target=self.process_input_sockets,
                 args=(
@@ -931,6 +980,7 @@ class EngineCoreProc(EngineCore):
             )
             input_thread.start()
 
+            # 线程 B：输出线程。负责从 self.output_queue 拿结果，序列化后通过 ZMQ 发回
             self.output_thread = threading.Thread(
                 target=self.process_output_sockets,
                 args=(
@@ -942,10 +992,11 @@ class EngineCoreProc(EngineCore):
             )
             self.output_thread.start()
 
-            # Don't complete handshake until DP coordinator ready message is
-            # received.
+            # 6. 【最后的验证】：等待协调器就绪信号
+            # 除非收到 READY 消息，否则不完成初始化
             while not ready_event.wait(timeout=10):
                 if not input_thread.is_alive():
+                    # 如果后台线程直接崩了（如端口占用），抛出错误
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
@@ -1586,20 +1637,30 @@ class EngineCoreProc(EngineCore):
 
     def process_input_sockets(
         self,
-        input_addresses: list[str],
-        coord_input_address: str | None,
-        identity: bytes,
-        ready_event: threading.Event,
+        input_addresses: list[str],     # 前台发送数据的 ZMQ 管道地址
+        coord_input_address: str | None,# 用于数据并行 (DP) 状态同步的协调器地址
+        identity: bytes,                # 当前 GPU 的身份证号 (如 b'\x00\x00')
+        ready_event: threading.Event,   # 用于通知主线程“小工已就位”的事件锁
     ):
-        """Input socket IO thread."""
+        """Input socket IO thread. 专门处理底层网络接收的后台守护线程"""
 
-        # Msgpack serialization decoding with optional tensor IPC receiver.
+        # ---------------------------------------------------------
+        # 1. 准备拆包工具 (Msgpack Decoders)
+        # ---------------------------------------------------------
+        # Msgpack 是一种比 JSON 快得多、体积小得多的二进制序列化格式。
+        # oob_tensor_provider: 这是处理“带外数据 (Out-of-band)”的机制。
+        # 如果包裹里带有极其庞大的多模态 Tensor，解码器会去共享内存 (IPC) 里提货，而不是在网络管道里死磕。
         add_request_decoder = MsgpackDecoder(
             EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
         )
         generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
 
+        # 使用 ExitStack 和 Context 确保线程崩溃时，网络端口能被干净地释放
         with ExitStack() as stack, zmq.Context() as ctx:
+            
+            # ---------------------------------------------------------
+            # 2. 建立通信基站 (Socket Initialization)
+            # ---------------------------------------------------------
             input_sockets = [
                 stack.enter_context(
                     make_zmq_socket(
@@ -1607,69 +1668,98 @@ class EngineCoreProc(EngineCore):
                     )
                 )
                 for input_address in input_addresses
-            ]
+            ] # 创建 DEALER 套接字，并挂上自己的 identity 铭牌，主动连接 (bind=False) 到前台
+            
+            # (可选) 如果有多机/多卡协同，连接到全局状态协调器
             if coord_input_address is None:
                 coord_socket = None
             else:
                 coord_socket = stack.enter_context(
                     make_zmq_socket(
-                        ctx,
-                        coord_input_address,
-                        zmq.XSUB,
-                        identity=identity,
-                        bind=False,
+                        ctx, coord_input_address, zmq.XSUB, identity=identity, bind=False,
                     )
                 )
-                # Send subscription message to coordinator.
+                # 向协调器发送 \x01 (订阅消息)，表示我要监听全局调度的指令
                 coord_socket.send(b"\x01")
 
-            # Register sockets with poller.
+            # ---------------------------------------------------------
+            # 3. 开启多路复用雷达 (ZMQ Poller & Handshake)
+            # ---------------------------------------------------------
+            # 为什么用 Poller？因为小工可能同时盯着好几根管道（主管道、协调器管道等）。
+            # Poller 可以让线程在没有数据时休眠，任何一根管道有动静就立刻唤醒它，不浪费一点 CPU。
             poller = zmq.Poller()
             for input_socket in input_sockets:
-                # Send initial message to each input socket - this is required
-                # before the front-end ROUTER socket can send input messages
-                # back to us.
+                # 【ZMQ 底层强制握手协议】：
+                # 因为前台是 ROUTER，后台是 DEALER。如果 DEALER 不主动发条消息，
+                # ROUTER 根本不知道你上线了。发一个空的 b"" 仅仅是为了激活连接。
                 input_socket.send(b"")
+                # 把管道注册到雷达上，POLLIN 表示监听“是否有数据进来”
                 poller.register(input_socket, zmq.POLLIN)
 
             if coord_socket is not None:
-                # Wait for ready message from coordinator.
+                # 等待大堂经理（协调器）喊“开始营业 (READY)”
                 assert coord_socket.recv() == b"READY"
                 poller.register(coord_socket, zmq.POLLIN)
 
+            # 告诉启动这个线程的老大：“雷达已开启，小工就位，可以开始干活了！”
             ready_event.set()
             del ready_event
+            
+            # ---------------------------------------------------------
+            # 4. 核心死循环：接单与分拣 (The Event Loop)
+            # ---------------------------------------------------------
             while True:
+                # 阻塞在这里，直到雷达发现有管道传来了数据
                 for input_socket, _ in poller.poll():
-                    # (RequestType, RequestData)
+                    
+                    # ---------------------------------------------------------
+                    # 4.1 零拷贝接收与解帧
+                    # ---------------------------------------------------------
+                    # 还记得前台发的是三段式包裹吗？[地址, 指令, 数据]。
+                    # 地址在路由时被剥离了。这里直接收到：[指令, 数据]。
                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
-                    # NOTE(yongji): ignore READY message sent by DP coordinator
-                    # that is used to notify newly started engines
+                    
                     if type_frame.buffer == b"READY":
                         assert input_socket == coord_socket
-                        continue
+                        continue # 忽略协调器发来的冗余 READY 信号
+                        
+                    # 将第一段二进制转换为枚举类型（例如 ADD 或 ABORT）
                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
-                    # Deserialize the request data.
+                    # ---------------------------------------------------------
+                    # 4.2 反序列化 (解码)
+                    # ---------------------------------------------------------
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
+                        # 这是一个新订单，用专用的解码器还原成 EngineCoreRequest 对象
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
+                            # 预处理（比如检查多模态指针是否有效）
                             request = self.preprocess_add_request(req)
                         except Exception:
+                            # 如果订单本身是坏的，处理报错并丢弃，继续接下一单
                             self._handle_request_preproc_error(req)
                             continue
                     else:
+                        # 对于取消任务等简单指令，用通用解码器
                         request = generic_decoder.decode(data_frames)
 
+                        # ---------------------------------------------------------
+                        # 4.3 优先级双通道分发 (ABORT 的特权)
+                        # ---------------------------------------------------------
                         if request_type == EngineCoreRequestType.ABORT:
-                            # Aborts are added to *both* queues, allows us to eagerly
-                            # process aborts while also ensuring ordering in the input
-                            # queue to avoid leaking requests. This is ok because
-                            # aborting in the scheduler is idempotent.
+                            # 【绝妙的并发设计】：
+                            # 如果用户取消了请求，这个指令会被**同时**塞进两个队列！
+                            # 1. 塞进 aborts_queue：这是一个紧急通道。GPU 调度器会优先看这个，
+                            #    立刻把作废的任务从显存里踢出去，释放宝贵的资源。
+                            # 2. 依然塞进 input_queue：为了保证时间顺序的完整性，防止内部状态机混乱。
                             self.aborts_queue.put_nowait(request)
 
-                    # Push to input queue for core busy loop.
+                    # ---------------------------------------------------------
+                    # 4.4 挂单入厨
+                    # ---------------------------------------------------------
+                    # 拆包、校验完毕，把标准化的指令和请求对象，塞进后台的核心队列。
+                    # GPU 主线程 (run_busy_loop) 正盯着这个队列，拿走就直接开火计算！
                     self.input_queue.put_nowait((request_type, request))
 
     def process_output_sockets(

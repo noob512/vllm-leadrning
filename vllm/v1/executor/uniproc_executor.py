@@ -110,24 +110,49 @@ class UniProcExecutor(Executor):
 
     def collective_rpc(  # type: ignore[override]
         self,
-        method: str | Callable,
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict | None = None,
-        non_block: bool = False,
-        single_value: bool = False,
+        method: str | Callable,       # 要让底层 Worker 执行的方法名（比如 "execute_model"）
+        timeout: float | None = None, # 超时时间（本地调用基本用不上）
+        args: tuple = (),             # 传递的参数（比如 scheduler_output 施工图纸）
+        kwargs: dict | None = None,   # 传递的关键字参数
+        non_block: bool = False,      # 是否开启非阻塞（异步）模式
+        single_value: bool = False,   # 是否只返回一个单一结果
     ) -> Any:
+        """
+        单卡环境下的“伪·分布式集体调用”。
+        它的核心作用是：抹平单机和多机分布式的 API 差异，并处理底层的异步 CUDA 同步逻辑。
+        """
         if kwargs is None:
             kwargs = {}
 
+        # ---------------------------------------------------------
+        # 1. 阻塞模式 (Sync Mode)
+        # ---------------------------------------------------------
+        # 如果要求阻塞（比如初始化模型权重时），直接在主线程执行。
         if not non_block:
+            # run_method 本质上就是: getattr(self.driver_worker, method)(*args, **kwargs)
+            # 因为只有 1 张卡，所以直接调唯一的那个 driver_worker。
             result = run_method(self.driver_worker, method, args, kwargs)
+            # 伪装成分布式的返回值格式：如果不是 single_value，就把它包成列表 [result]
             return result if single_value else [result]
 
+        # ---------------------------------------------------------
+        # 2. 非阻塞模式 (Async / Non-blocking Mode) - 核心性能区
+        # ---------------------------------------------------------
         try:
+            # 即使是非阻塞，我们依然先直接调用本地的 worker 方法。
+            # 这里的巧妙之处在于，对于 execute_model，底层是将任务塞进 CUDA Stream（GPU 异步流），
+            # 所以 Python 代码这一步几乎是瞬间完成的，返回一个代表“未决状态”的 AsyncModelRunnerOutput 对象。
             result = run_method(self.driver_worker, method, args, kwargs)
+            
+            # 判断返回值是不是一个“需要等待 GPU 同步的异步对象”
             if isinstance(result, AsyncModelRunnerOutput):
+                # 检查系统有没有开启专门用来收尾的后台线程
                 if (async_thread := self.async_output_thread) is not None:
+                    
+                    # 【核心解耦】：将“死等 GPU 算完”这个动作 (result.get_output)，
+                    # 扔给后台的专属线程去阻塞等待。
+                    # async_thread.submit 会立刻返回一个标准的 Python Future（期权凭证）。
+                    # 这样当前的大堂经理 (主线程) 就可以立刻脱身去算 Grammar Mask 语法掩码了！
                     if single_value:
                         return async_thread.submit(result.get_output)
 
@@ -135,12 +160,28 @@ class UniProcExecutor(Executor):
                         return [result.get_output()]
 
                     return async_thread.submit(get_output_list)
+                
+                # 如果没开后台线程，那没办法，只能在这个线程里硬等（降级为阻塞）
                 result = result.get_output()
+                
+            # ---------------------------------------------------------
+            # 3. 包装 Future 凭证
+            # ---------------------------------------------------------
+            # 如果调用的不是异步方法，瞬间拿到了真实数据，
+            # 为了 API 的统一，依然强行用 Future 包装一层，并立刻设为 set_result。
             future = Future[Any]()
             future.set_result(result if single_value else [result])
+            
         except Exception as e:
+            # ---------------------------------------------------------
+            # 4. 瞬间异常捕获 (Fast-fail)
+            # ---------------------------------------------------------
+            # 如果上面的调用瞬间报错（比如压根没找到方法，或者传参错误），
+            # 不要让程序直接崩溃，而是把报错信息装进 Future 盒子里。
+            # 这样上一层 (execute_model) 检查 future.done() 时，就能优雅地把异常抛出来。
             future = Future[Any]()
             future.set_exception(e)
+            
         return future
 
     def execute_model(  # type: ignore[override]

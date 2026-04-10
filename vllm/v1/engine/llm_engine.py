@@ -374,44 +374,83 @@ class LLMEngine:
         return req_id
 
     def step(self) -> list[RequestOutput | PoolingRequestOutput]:
-        if self.should_execute_dummy_batch:
-            self.should_execute_dummy_batch = False
-            self.engine_core.execute_dummy_batch()
-            return []
+            """
+            驱动大模型推理引擎往前走一步（进行一次前向传播 Forward Pass）。
+            返回本次步骤中更新的请求输出列表。
+            """
 
-        # 1) Get EngineCoreOutput from the EngineCore.
-        with record_function_or_nullcontext("llm_engine step: get_output"):
-            outputs = self.engine_core.get_output()
+            # ---------------------------------------------------------
+            # 0. 暖场与消防演习 (Dummy Batch)
+            # ---------------------------------------------------------
+            # 引擎刚启动时，第一次调用 step 不会真正处理用户的请求，
+            # 而是跑一个“假数据批次 (Dummy Batch)”。
+            # 目的：为了进行显存的极限探测 (Profile KV Cache) 或者捕获 CUDA Graphs。
+            if self.should_execute_dummy_batch:
+                self.should_execute_dummy_batch = False
+                self.engine_core.execute_dummy_batch()
+                return [] # 演习不产生真实结果，直接返回空列表
 
-        # 2) Process EngineCoreOutputs.
-        with record_function_or_nullcontext("llm_engine step: process_outputs"):
-            iteration_stats = IterationStats() if self.log_stats else None
-            processed_outputs = self.output_processor.process_outputs(
-                outputs.outputs,
-                engine_core_timestamp=outputs.timestamp,
-                iteration_stats=iteration_stats,
-            )
-            self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
+            # ---------------------------------------------------------
+            # 1. 收割原始结果 (Get Raw Output)
+            # ---------------------------------------------------------
+            # 去 EngineCore（引擎核心）拿这一轮算出来的结果。
+            # 注意：这里隐藏了巨量的操作！EngineCore 会在这里调用 Scheduler（调度器）挑出任务，
+            # 然后命令 GPU 跑一次矩阵乘法，最后把 GPU 吐出来的原始数字（Token IDs）拿回来。
+            with record_function_or_nullcontext("llm_engine step: get_output"):
+                outputs = self.engine_core.get_output()
 
-        # 3) Abort any reqs that finished due to stop strings.
-        with record_function_or_nullcontext("llm_engine step: abort_requests"):
-            self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
-
-        # 4) Record stats
-        with record_function_or_nullcontext("llm_engine step: record_stats"):
-            if (
-                self.logger_manager is not None
-                and outputs.scheduler_stats is not None
-                and len(outputs.outputs) > 0
-            ):
-                self.logger_manager.record(
-                    scheduler_stats=outputs.scheduler_stats,
+            # ---------------------------------------------------------
+            # 2. 精加工与翻译 (Process Outputs)
+            # ---------------------------------------------------------
+            # GPU 吐出来的只有干巴巴的数字 (Token IDs)，人类看不懂，且不知道句子结没结束。
+            # output_processor 是“翻译官兼质检员”。
+            with record_function_or_nullcontext("llm_engine step: process_outputs"):
+                iteration_stats = IterationStats() if self.log_stats else None
+                
+                # 【核心操作】：
+                # 1. 解码 (Detokenization)：把 [234, 567] 变成 "你好"。
+                # 2. 停止词检测：检查这句话是不是碰到了用户设定的 stop string（比如遇到了 "User:"）。
+                # 3. 组装：把这些信息打包成 RequestOutput 对象。
+                processed_outputs = self.output_processor.process_outputs(
+                    outputs.outputs,
+                    engine_core_timestamp=outputs.timestamp,
                     iteration_stats=iteration_stats,
-                    mm_cache_stats=self.renderer.stat_mm_cache(),
                 )
-                self.do_log_stats_with_interval()
+                # 把调度器这一步的状态（比如有没有人被抢占、挤出队列）同步给处理中心
+                self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
-        return processed_outputs.request_outputs
+            # ---------------------------------------------------------
+            # 3. 拔管与清退 (Abort Requests)
+            # ---------------------------------------------------------
+            # 为什么要有这一步？
+            # 因为 GPU 只负责像无情的打字机一样吐 Token，它不知道什么时候该停。
+            # 在第 2 步中，output_processor 发现某些请求已经生成完毕了（比如遇到了句号或最大长度）。
+            # 它会把这些请求的 ID 放入 `reqs_to_abort` 列表中。
+            # 这一步就是告诉底层的 EngineCore：“这几桌客人吃完了，赶紧把他们的请求注销，把他们占用的显存（KV Cache）释放出来给新人用！”
+            with record_function_or_nullcontext("llm_engine step: abort_requests"):
+                self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+
+            # ---------------------------------------------------------
+            # 4. 记账与性能监控 (Record Stats)
+            # ---------------------------------------------------------
+            # 记录这家餐厅这一秒钟的营业数据，用于在终端打印或者发送给 Prometheus 监控系统。
+            with record_function_or_nullcontext("llm_engine step: record_stats"):
+                if (
+                    self.logger_manager is not None
+                    and outputs.scheduler_stats is not None
+                    and len(outputs.outputs) > 0
+                ):
+                    self.logger_manager.record(
+                        scheduler_stats=outputs.scheduler_stats, # 排队和显存占用率
+                        iteration_stats=iteration_stats,         # 这一步耗时多少毫秒
+                        mm_cache_stats=self.renderer.stat_mm_cache(), # 多模态（图片）缓存命中率
+                    )
+                    self.do_log_stats_with_interval() # 定期打印那串绿色的吞吐量日志
+
+            # 5. 端菜上桌
+            # 返回经过精心包装、翻译好、打好标签（是否 finished）的列表。
+            # 这串列表就会被上一节我们分析的 `_run_engine` 里的 while 循环接收！
+            return processed_outputs.request_outputs
 
     def start_profile(self, profile_prefix: str | None = None):
         self.engine_core.profile(True, profile_prefix)
