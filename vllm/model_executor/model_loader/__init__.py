@@ -118,10 +118,36 @@ def register_model_loader(load_format: str):
 
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
-    """Get a model loader based on the load format."""
+    """
+    根据加载格式（load_format）获取相应的模型加载器实例。
+    
+    该函数充当工厂接口，将加载逻辑与具体的权重格式解耦。vLLM 支持多种格式，
+    例如 'auto', 'pt', 'safetensors', 'dummy', 'gguf' 等。
+    
+    参数:
+        load_config: 包含加载配置的对象，其中最重要的属性是 load_format。
+        
+    返回:
+        BaseModelLoader 的子类实例，负责后续具体的权重读取和张量转换。
+        
+    异常:
+        ValueError: 如果指定的加载格式不在支持的注册表（Registry）中，则抛出异常。
+    """
+    
+    # 1. 从配置中提取用户指定的加载格式（例如: "safetensors"）
     load_format = load_config.load_format
+    
+    # 2. 安全性检查
+    # _LOAD_FORMAT_TO_MODEL_LOADER 是一个全局注册表（通常是 Dict[str, Type[BaseModelLoader]]）
+    # 它将字符串格式映射到对应的加载器类。
     if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
-        raise ValueError(f"Load format `{load_format}` is not supported")
+        # 如果用户输入了不支持的格式（如 `load_format="magic_format"`），直接阻断运行。
+        raise ValueError(f"加载格式 `{load_format}` 不受支持。")
+    
+    # 3. 实例化并返回加载器
+    # 注意：注册表中存储的是“类”而非“实例”。
+    # 这里通过 _LOAD_FORMAT_TO_MODEL_LOADER[load_format] 获取对应的类，
+    # 然后传入 load_config 进行初始化 (constructor call)。
     return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
 
 

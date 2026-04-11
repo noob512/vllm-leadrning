@@ -253,51 +253,57 @@ class Worker(WorkerBase):
             )
         return allocator.use_memory_pool(tag=tag)
 
-    @instrument(span_name="Init device")
+    @instrument(span_name="Init device") # 性能探针，记录这整个初始化过程耗时
     def init_device(self):
+        # ---------------------------------------------------------
+        # 阶段 1：物理设备绑定与“工位”计算 (Hardware Binding & Rank Math)
+        # ---------------------------------------------------------
         if self.device_config.device_type == "cuda":
-            # This env var set by Ray causes exceptions with graph building.
+            # 踢掉 Ray 带来的一个恶心 BUG：Ray 默认注入的环境变量会干扰 CUDA Graph 的静态图捕获。
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+            
             parallel_config = self.parallel_config
+            # 【极度复杂的分布式坐标换算】
+            # 如果不是用 Ray 或者外部启动器（说明可能是原生 Multiprocessing 启动），
+            # 且启用了 DP (数据并行) + TP (张量并行) + PP (流水线并行) 的混合 3D 并行时，
+            # 必须重新计算当前进程应该霸占这台机器上的哪一张卡 (local_rank)。
             if (
-                parallel_config.distributed_executor_backend
-                not in ("ray", "external_launcher")
+                parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
                 and parallel_config.data_parallel_backend != "ray"
                 and parallel_config.nnodes_within_dp == 1
             ):
-                # Use local DP rank if available, otherwise use global DP rank.
+                # 获取局部的数据并行 Rank
                 dp_local_rank = self.parallel_config.data_parallel_rank_local
                 if dp_local_rank is None:
                     dp_local_rank = self.parallel_config.data_parallel_index
 
+                # 计算一个完整的模型副本需要多少张卡 (TP * PP)
                 tp_pp_world_size = (
                     self.parallel_config.pipeline_parallel_size
                     * self.parallel_config.tensor_parallel_size
                 )
 
-                # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
+                # 【公式】：当前卡的物理槽位 = DP组号 * 单个模型所需卡数 + 组内卡号
                 self.local_rank += dp_local_rank * tp_pp_world_size
-                assert self.local_rank < torch.accelerator.device_count(), (
-                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
-                )
-                visible_device_count = (
-                    torch.accelerator.device_count() if torch.cuda.is_available() else 0
-                )
-                assert self.parallel_config.local_world_size <= visible_device_count, (
-                    f"local_world_size ({self.parallel_config.local_world_size}) must "
-                    f"be less than or equal to the number of visible devices "
-                    f"({visible_device_count})."
-                )
+                
+                # 防御性断言：防止算出来的物理卡号超出了机器上实际插入的显卡总数
+                assert self.local_rank < torch.accelerator.device_count(), (...)
+                visible_device_count = torch.accelerator.device_count() if torch.cuda.is_available() else 0
+                assert self.parallel_config.local_world_size <= visible_device_count, (...)
 
+            # 【核心物理动作】：将当前 Python 进程死死绑定到算出来的这块 GPU 上！
             self.device = torch.device(f"cuda:{self.local_rank}")
             torch.accelerator.set_device_index(self.device)
 
+            # 检查当前这块卡是不是太老了，支不支持用户要求的精度 (比如老卡跑不了 bfloat16 或 fp8)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
-            # Initialize the distributed environment BEFORE taking
-            # memory snapshot
-            # This ensures NCCL buffers are allocated before we measure
-            # available memory
+            # ---------------------------------------------------------
+            # 阶段 2：底层硬件建网 (Distributed Networking Initialization)
+            # ---------------------------------------------------------
+            # 【极其关键的顺序】：必须在“测量可用显存”之前，初始化 NCCL (分布式环境)！
+            # 因为 NCCL 建群时，为了保证通信速度，会强行向这块 GPU 申请一笔“公款”（内部通信 Buffer，通常几百MB）。
+            # 如果先测显存再建群，算出来的 KV Cache 可用空间就会偏大，导致后期直接 OOM。
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -309,55 +315,84 @@ class Worker(WorkerBase):
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner", scope="local")
 
-            # Set random seed.
+            # 设定随机种子，保证所有卡在某些需要随机的操作（比如某些采样或初始化）时步调一致
             set_random_seed(self.model_config.seed)
 
-            # Now take memory snapshot after NCCL is initialized
+            # ---------------------------------------------------------
+            # 阶段 3：显存大清查 (Memory Profiling & Snapshot)
+            # ---------------------------------------------------------
+            # NCCL 建群完毕，现在强制做一次深度的垃圾回收和显存清理，把碎渣倒掉。
             gc.collect()
             torch.accelerator.empty_cache()
 
-            # take current memory snapshot
+            # 【拍快照】：记录当前 GPU 显存的精确状态（总共多少，还剩多少）。
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
+            # 【预留口粮】：基于当前快照，系统会计算出“框架自身和各种杂项需要预留多少显存”，
+            # 剩下的所有显存，稍后将被 PagedAttention 全部霸占！
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
-            logger.debug(
-                "worker requested memory: %sGiB", format_gib(self.requested_memory)
-            )
+            logger.debug("worker requested memory: %sGiB", format_gib(self.requested_memory))
+            
         else:
+            # 如果不是 CUDA/兼容架构，直接罢工
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
-        # Initialize workspace manager
+        # ---------------------------------------------------------
+        # 阶段 4：组装计算引擎 (Engine Instantiation)
+        # ---------------------------------------------------------
+        # 初始化 Workspace 管理器：用于为底层自定义的 CUDA 算子分配临时内存池。
+        # 如果开启了 DBO (微批处理优化)，需要给它双倍的临时池 (num_ubatches=2)。
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        # Construct the model runner
+        # 【终极武器出库】：实例化 ModelRunner！
+        # 注意：此时模型权重仍然还没有加载。这里只是把 Runner 组装好。
+        # 稍后外层会调用 `worker.load_model()`，Runner 才会真正使用 Meta Device 和 mmap 去吸入权重。
         if self.use_v2_model_runner:
-            from vllm.v1.worker.gpu.model_runner import (
-                GPUModelRunner as GPUModelRunnerV2,
-            )
-
-            # HACK(woosuk): This is a temporary fix to avoid type errors.
+            from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
             self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
                 self.vllm_config, self.device
             )
         else:
-            from vllm.v1.worker.gpu_model_runner import (
-                GPUModelRunner as GPUModelRunnerV1,
-            )
-
+            from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
 
+        # ---------------------------------------------------------
+        # 阶段 5：主节点打卡 (Telemetry)
+        # ---------------------------------------------------------
         if self.rank == 0:
-            # If usage stat is enabled, collect relevant info.
+            # 如果是全局 0 号卡（总指挥），负责向官方发送一下匿名使用统计数据
             report_usage_stats(self.vllm_config)
-
-    # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
-    # to hijack tensor allocation.
+        
+        # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
+        # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        """
+        加载模型权重到 GPU。
+        
+        参数:
+        - load_dummy_weights: 如果为 True，则不加载真实权重，而是初始化随机/空权重。
+        这通常用于显存分析（Profiling）或测试，以避免昂贵的磁盘 I/O。
+        """
+        
+        # 使用括号语法同时开启多个上下文管理器（Python 3.10+ 支持）
         with (
+            # 1. 显存池上下文管理
+            # 尝试获取一个专门标记为 "weights" 的显存池上下文。
+            # 在多卡或复杂显存管理环境下，这可以确保模型权重的分配发生在特定的显存池中，
+            # 减少显存碎片，并方便后续对权重占用的显存进行统一追踪或回收。
             self._maybe_get_memory_pool_context(tag="weights"),
+            
+            # 2. 全局配置上下文绑定
+            # set_current_vllm_config 是一个线程局部（Thread-local）的上下文管理器。
+            # 它可以将当前的 vllm_config 设为全局可用，这样模型深层的各种算子（Layer/Kernel）
+            # 就不需要一层层传递配置对象，直接通过全局 Hook 即可读取所需的架构参数。
             set_current_vllm_config(self.vllm_config),
         ):
+            # 3. 核心加载动作
+            # 实际的加载逻辑委托给了内部的 self.model_runner 对象。
+            # model_runner 会根据前面的配置实例化真正的神经网络类（如 LlamaForCausalLM），
+            # 并将模型参数从磁盘（或 CPU 内存）搬运到当前 GPU 的显存中。
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
     def update_config(self, overrides: dict[str, Any]) -> None:

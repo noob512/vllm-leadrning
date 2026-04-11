@@ -373,9 +373,29 @@ class WorkerWrapperBase:
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore
 
     def init_device(self):
+        """
+        初始化物理设备（GPU/TPU）。
+        这个方法属于 WorkerWrapper（工头），它的核心任务是安全地唤醒底层的真正 Worker，
+        并确保在唤醒的过程中，底层的 C++/CUDA 代码能随时读取到全局配置。
+        """
+        
+        # 【安全防线 (Sanity Check)】
+        # 确保在点火前，引擎（Engine）已经把包含了万事万物的 vllm_config 塞给当前这个 Wrapper 了。
+        # 如果是 None，说明系统初始化顺序乱了，直接报错拦截，防止后续出现空指针引发的玄学崩溃。
         assert self.vllm_config is not None
+
+        # 【开启全局虫洞 (Context Manager)】
+        # `set_current_vllm_config` 是一个上下文管理器 (Context Manager)。
+        # 它的作用是：在当前线程中，临时把 `self.vllm_config` 挂载为一个“全局可见”的变量。
+        # 为什么要这样？因为等会儿执行 init_device 时，可能会调用极其底层的 C++ 算子或者第三方库。
+        # 如果不用上下文，你就得把 config 当作参数，一层一层地穿透传递下去，代码会非常臃肿。
         with set_current_vllm_config(self.vllm_config):
-            # To make vLLM config available during device initialization
+            # 官方注释：为了在设备初始化期间，让底层的代码能够随时获取到 vLLM 的配置。
+            
+            # 【真正点火 (Delegation)】
+            # Wrapper 本身是个空壳，这里正式把命令下发给真正干活的 self.worker（比如 GPUWorker）。
+            # 底层的 worker.init_device() 会真正去执行 `torch.cuda.set_device()` 和 NCCL 的建群动作。
+            # `# type: ignore` 是告诉 Mypy 类型检查器：“我知道基类里可能没声明这个方法，但我保证运行时底层的子类一定有，你别给我报黄线警告了。”
             self.worker.init_device()  # type: ignore
 
     def __getattr__(self, attr: str):

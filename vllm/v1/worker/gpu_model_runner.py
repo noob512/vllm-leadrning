@@ -389,142 +389,154 @@ class ExecuteModelState(NamedTuple):
 
 
 class GPUModelRunner(
-    LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+    LoRAModelRunnerMixin, # 提供 LoRA (Low-Rank Adaptation) 相关功能的支持
+    KVConnectorModelRunnerMixin, # 提供 KV 缓存连接器相关功能的支持
+    ECConnectorModelRunnerMixin # 提供 EC (Encoder-Context) 连接器相关功能的支持
 ):
     def __init__(
         self,
-        vllm_config: VllmConfig,
-        device: torch.device,
+        vllm_config: VllmConfig, # 包含所有配置信息的对象
+        device: torch.device, # 指定模型运行的设备（通常是 GPU）
     ):
+        # --- 配置对象 ---
+        # 将传入的 vllm_config 中的各种子配置保存为实例变量，便于后续访问
         self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.cache_config = vllm_config.cache_config
-        self.offload_config = vllm_config.offload_config
-        self.compilation_config = vllm_config.compilation_config
-        self.lora_config = vllm_config.lora_config
-        self.load_config = vllm_config.load_config
-        self.parallel_config = vllm_config.parallel_config
-        self.scheduler_config = vllm_config.scheduler_config
-        self.speculative_config = vllm_config.speculative_config
-        self.observability_config = vllm_config.observability_config
+        self.model_config = vllm_config.model_config # 模型结构、大小等配置
+        self.cache_config = vllm_config.cache_config # KV 缓存类型、块大小等配置
+        self.offload_config = vllm_config.offload_config # 权重卸载配置
+        self.compilation_config = vllm_config.compilation_config # 编译优化（如 CUDA Graph）配置
+        self.lora_config = vllm_config.lora_config # LoRA 配置
+        self.load_config = vllm_config.load_config # 模型加载配置
+        self.parallel_config = vllm_config.parallel_config # 并行策略（TP, PP, DP）配置
+        self.scheduler_config = vllm_config.scheduler_config # 请求调度配置
+        self.speculative_config = vllm_config.speculative_config # 推测解码配置
+        self.observability_config = vllm_config.observability_config # 可观察性（监控、日志）配置
 
+        # --- 设备和数据类型 ---
+        # 从配置中提取常用的模型和缓存配置
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
-        self.device = device
-        self.pin_memory = is_pin_memory_available()
-        self.dtype = self.model_config.dtype
+        self.device = device # 保存设备引用
+        self.pin_memory = is_pin_memory_available() # 检查是否可以使用固定内存（用于 CPU-GPU 数据传输加速）
+        self.dtype = self.model_config.dtype # 获取模型权重的数据类型（如 float16, bfloat16）
 
+        # 根据配置字符串确定 KV 缓存张量的实际数据类型
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
         )
 
+        # --- 模型类型判断 ---
+        # 判断模型是否为池化模型（输出向量而非序列）
         self.is_pooling_model = model_config.runner_type == "pooling"
+        # 判断是否启用提示嵌入（prompt embeddings）
         self.enable_prompt_embeds = model_config.enable_prompt_embeds
+        # 判断是否为仅接受原始多模态输入的模型
         self.is_multimodal_raw_input_only_model = (
             model_config.is_multimodal_raw_input_only_model
         )
-        # These will be overridden in load_model()
-        self.is_multimodal_pruning_enabled = False
-        self.requires_sequential_video_encoding = False
-        # Set to True after init_routed_experts_capturer() completes.
-        # Prevents routed experts code from running during profiling/dummy run.
+        # 这些将在 load_model() 方法中被覆盖
+        self.is_multimodal_pruning_enabled = False # 多模态剪枝是否启用
+        self.requires_sequential_video_encoding = False # 视频编码是否需要按顺序
+        # 标记路由专家（Routed Experts）是否已初始化
         self.routed_experts_initialized = False
-        self.max_model_len = model_config.max_model_len
+        self.max_model_len = model_config.max_model_len # 模型的最大上下文长度
 
-        # Always set to false after the first forward pass
+        # --- 调度和并行相关 ---
+        # 是否在第一次前向传播后禁用 KV 缩放计算
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
+        # 解码上下文并行（DCP）的世界大小（参与 DCP 的进程数）
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
+        # 当前 DCP 进程组内的排名
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
+        # 最大批处理令牌数
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        # 最大请求数
         self.max_num_reqs = scheduler_config.max_num_seqs
 
-        # Broadcast PP output for external_launcher (torchrun)
-        # to make sure we are synced across pp ranks
-        # TODO: Support overlapping micro-batches
-        # https://github.com/vllm-project/vllm/issues/18019
+        # 在外部启动器（如 torchrun）下，跨 PP（流水线并行）排名广播输出
         self.broadcast_pp_output = (
             self.parallel_config.distributed_executor_backend == "external_launcher"
             and len(get_pp_group().ranks) > 1
         )
 
-        # Model-related.
+        # --- 模型架构相关 ---
+        # 注意力头数量
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
+        # 输入嵌入的大小（对于某些多模态模型）
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
-        # Only relevant for models using ALiBi (e.g, MPT)
+        # 模型是否使用 ALiBi 位置编码
         self.use_alibi = model_config.uses_alibi
 
+        # 是否启用级联注意力
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
+        # 是否为多模态前缀语言模型
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
 
-        # Multi-modal data support
+        # --- 多模态数据支持 ---
+        # 多模态注册表，管理支持的多模态类型
         self.mm_registry = MULTIMODAL_REGISTRY
+        # 模型是否使用 M-RoPE（用于视觉语言模型如 Qwen2-VL）
         self.uses_mrope = model_config.uses_mrope
+        # 模型是否使用 XD-RoPE（用于特定视觉语言模型如 HunYuan-VL）
         self.uses_xdrope_dim = model_config.uses_xdrope_dim
+        # 模型是否支持多模态输入
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
         )
 
+        # 对于编码器-解码器模型，设置编码器的最大输入长度
         if self.model_config.is_encoder_decoder:
-            # Maximum length of the encoder input, only for encoder-decoder
-            # models.
             self.max_encoder_len = scheduler_config.max_num_encoder_input_tokens
         else:
             self.max_encoder_len = 0
 
-        # Async scheduling
+        # --- 异步调度 ---
+        # 是否启用异步调度
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
-        # Sampler
+        # --- 采样器 ---
+        # 创建采样器，用于根据 logits 生成 token
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
 
+        # --- 专家并行负载均衡器状态 ---
+        # 专家并行负载均衡器的状态（懒加载）
         self.eplb_state: EplbState | None = None
-        # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
+        # 临时抑制 EPLB（Expert Parallel Load Balancer）的标志
         self.eep_eplb_suppressed = False
-        """
-        State of the expert parallelism load balancer.
 
-        Will be lazily initialized when the model is loaded.
-        """
-
-        # Lazy initializations
-        # self.model: nn.Module  # Set after load_model
-        # Initialize in initialize_kv_cache
+        # --- 懒加载组件 ---
+        # 模型本身将在 load_model 方法中加载
+        # self.model: nn.Module
+        # KV 缓存在 initialize_kv_cache 方法中初始化
         self.kv_caches: list[torch.Tensor] = []
-        # Initialize in initialize_kv_cache_tensors
+        # 交叉层（Cross-attention）的 KV 缓存
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
-        # indexes: [kv_cache_group_id][attn_group]
+        # 注意力组列表
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
 
-        # mm_hash ->  encoder_output
+        # --- 编码器缓存和后期交互 ---
+        # 用于缓存多模态编码器的输出，键为哈希值
         self.encoder_cache: dict[str, torch.Tensor] = {}
+        # 后期交互运行器（用于某些复杂的多模态模型）
         self.late_interaction_runner = LateInteractionRunner()
 
-        # Encoder CUDA graph manager (initialized after model load if enabled)
+        # 编码器 CUDA 图管理器（如果启用）
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
+        # --- 辅助隐藏状态输出 ---
+        # 是否使用辅助隐藏状态输出（通常与特定的推测解码方法一起使用）
         self.use_aux_hidden_state_outputs = False
-        # Set up speculative decoding.
-        # NOTE(Jiayi): currently we put the entire draft model on
-        # the last PP rank. This is not ideal if there are many
-        # layers in the draft model.
+
+        # --- 推测解码设置 ---
+        # 如果配置了推测解码，并且当前是 PP 组中的最后一个 rank，则初始化 drafter
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                NgramProposer  # noqa: F823
-                | NgramProposerGPU
-                | SuffixDecodingProposer
-                | EagleProposer
-                | DFlashProposer
-                | DraftModelProposer
-                | MedusaProposer
-                | ExtractHiddenStatesProposer
-            )
+            # 根据配置的方法创建不同的推测解码提议者
             if self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
@@ -532,8 +544,9 @@ class GPUModelRunner(
                     device=self.device,
                     runner=self,
                 )
-            elif self.speculative_config.use_ngram_gpu():
+            elif self.speculative_config.use_ngram_gpu(): # N-gram GPU 实现
                 self.drafter = NgramProposerGPU(self.vllm_config, self.device, self)
+                # 为 GPU N-gram 路径预分配张量
                 self.num_tokens_no_spec_gpu = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, device=device
                 )
@@ -549,61 +562,61 @@ class GPUModelRunner(
                 self._ngram_pinned_val_buf = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, pin_memory=True
                 )
-            elif self.speculative_config.use_dflash():
+            elif self.speculative_config.use_dflash(): # DFlash 推测解码
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
-                self.use_aux_hidden_state_outputs = True
-            elif self.speculative_config.method == "suffix":
+                self.use_aux_hidden_state_outputs = True # DFlash 通常需要辅助输出
+            elif self.speculative_config.method == "suffix": # 后缀解码
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
-            elif self.speculative_config.use_eagle():
+            elif self.speculative_config.use_eagle(): # Eagle 推测解码
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
                     self.use_aux_hidden_state_outputs = (
                         self.drafter.eagle3_use_aux_hidden_state
                     )
-            elif self.speculative_config.method == "medusa":
+            elif self.speculative_config.method == "medusa": # Medusa 推测解码
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config, device=self.device
                 )
-            elif self.speculative_config.method == "extract_hidden_states":
+            elif self.speculative_config.method == "extract_hidden_states": # 提取隐藏状态
                 self.drafter = ExtractHiddenStatesProposer(
                     vllm_config=self.vllm_config, device=self.device
                 )
-                self.use_aux_hidden_state_outputs = True
+                self.use_aux_hidden_state_outputs = True # 此方法也需要辅助输出
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
+            # 为推测解码创建拒绝采样器
             self.rejection_sampler = RejectionSampler(self.sampler)
 
+        # --- 推测解码参数 ---
+        # 推测的 token 数量
         self.num_spec_tokens = 0
+        # 存储验证通过的采样 token 数量的 GPU 张量
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_config = self.speculative_config.draft_model_config
+            # 确定 drafter 的最大模型长度
             if draft_config is not None and draft_config.max_model_len is not None:
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
+        # 是否使用异步推测解码
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
 
-        # Request states.
+        # --- 请求状态管理 ---
+        # 存储当前活跃请求的状态
         self.requests: dict[str, CachedRequestState] = {}
-        # NOTE(rob): num_prompt_logprobs only includes reqs
-        # that are currently in the prefill phase.
+        # 存储当前处于预填充阶段的请求的日志概率数量
         self.num_prompt_logprobs: dict[str, int] = {}
 
-        # Input Batch
-        # NOTE(Chen): Ideally, we should initialize the input batch inside
-        # `initialize_kv_cache` based on the kv cache config. However, as in
-        # https://github.com/vllm-project/vllm/pull/18298, due to some unknown
-        # reasons, we have to initialize the input batch before `load_model`,
-        # quantization + weight offloading will fail otherwise. As a temporary
-        # solution, we initialize the input batch here, and re-initialize it
-        # in `initialize_kv_cache` if the block_sizes here is different from
-        # the block_sizes in the kv cache config.
+        # --- 输入批处理 ---
+        # 初始化 InputBatch 对象，用于管理批量请求和输入数据
+        # 注意：由于量化和卸载的问题，必须在此处初始化，而不是在 load_model 之后
         logits_processors = model_config.logits_processors
         custom_logitsprocs: Sequence[str | type[LogitsProcessor]] = (
             tuple(logits_processors) if logits_processors is not None else ()
@@ -615,8 +628,6 @@ class GPUModelRunner(
         self._init_kernel_block_sizes = [placeholder_block_size]
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
-            # We need to use the encoder length for encoder-decoder
-            # because of KV cache for cross-attention.
             max_model_len=max(self.max_model_len, self.max_encoder_len),
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
@@ -632,27 +643,23 @@ class GPUModelRunner(
                 self.is_pooling_model,
                 custom_logitsprocs,
             ),
-            # We currently don't know whether a particular custom logits processor
-            # uses output token ids so we set this conservatively.
-            # ThinkingTokenBudgetLogitsProcessor also needs output token ids to
-            # correctly track think start/end token sequences in async scheduling.
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs)
             or self.vllm_config.reasoning_config is not None,
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
-        # Separate cuda stream for overlapping transfer of sampled token ids from
-        # GPU to CPU when async scheduling is enabled.
+        # --- 异步调度流和事件 ---
+        # 用于在启用异步调度时，将采样的 token ID 从 GPU 异步复制到 CPU 的流
         self.async_output_copy_stream: torch.cuda.Stream | None = None
-        # cuda event to synchronize use of reused CPU tensors between steps
-        # when async scheduling is enabled.
+        # 用于在步骤间同步重用 CPU 张量的 CUDA 事件
         self.prepare_inputs_event: torch.Event | None = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
 
-        # self.cudagraph_batch_sizes sorts in ascending order.
+        # --- CUDA Graph 批处理大小 ---
+        # 如果启用了 CUDA Graph 捕获，则设置捕获的批处理大小列表
         if (
             self.compilation_config.cudagraph_capture_sizes
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
@@ -663,14 +670,18 @@ class GPUModelRunner(
         else:
             self.cudagraph_batch_sizes = []
 
-        # Cache the device properties.
+        # --- 设备属性 ---
+        # 初始化并缓存设备属性
         self._init_device_properties()
 
-        # Encoder timing registry for observability
+        # --- 编码器计时统计 ---
+        # 用于存储编码器执行时间的字典和锁（用于可观察性）
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._encoder_timing_lock = threading.Lock()
 
-        # Persistent buffers for CUDA graphs.
+        # --- CUDA Graph 持久缓冲区 ---
+        # 预分配大量 GPU 和 CPU 张量作为持久缓冲区，避免在每个推理步骤中重复分配，
+        # 这对于 CUDA Graph 性能至关重要，因为图内不能动态分配内存。
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
@@ -691,20 +702,15 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32
         )
         self.req_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
-        # Maps current batch position -> previous batch position (-1 for new reqs)
         self.prev_positions = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_scheduled_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
-
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
-        # Because inputs_embeds may be bfloat16 and we don't need a numpy
-        # version of this tensor, avoid a RuntimeError by not creating a
-        # numpy buffer.
         self.inputs_embeds = self._make_buffer(
             self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
         )
@@ -719,75 +725,70 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32
         )
 
-        # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+        # 为 M-RoPE 预分配位置张量
         if self.uses_mrope:
-            # NOTE: `mrope_positions` is implemented with one additional dummy
-            # position on purpose to make it non-contiguous so that it can work
-            # with torch compile.
-            # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
-
-            # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
-            # the modality of inputs. For text-only inputs, each dimension has
-            # identical position IDs, making M-RoPE functionally equivalent to
-            # 1D-RoPE.
-            # See page 5 of https://arxiv.org/abs/2409.12191
             self.mrope_positions = self._make_buffer(
                 (3, self.max_num_tokens + 1), dtype=torch.int64
             )
 
-        # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+        # 为 XD-RoPE 预分配位置张量
         if self.uses_xdrope_dim > 0:
-            # Similar to mrope but use assigned dimension number for RoPE, 4 as default.
             self.xdrope_positions = self._make_buffer(
                 (self.uses_xdrope_dim, self.max_num_tokens + 1), dtype=torch.int64
             )
 
-        # None in the first PP rank. The rest are set after load_model.
+        # --- 中间张量 ---
+        # 用于 PP（流水线并行）中间结果传递（非第一个 PP rank）
         self.intermediate_tensors: IntermediateTensors | None = None
 
-        # OPTIMIZATION: Cache the arange tensors rather than creating them
-        # every step. Keep in int64 to avoid overflow with long context.
-        # - arange_np: immutable [0, 1, 2, ...] used as source for batched computation
-        # - query_pos: CpuGpuBuffer for the computed batched arange result
+        # --- 优化：缓存 arange 张量 ---
+        # 缓存 arange 张量以避免每步重新创建，提高性能
         arange_size = max(self.max_num_reqs + 1, self.max_num_tokens)
         self.arange_np = np.arange(arange_size, dtype=np.int64)
         self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
         self._arange_scratch = np.empty(arange_size, dtype=np.int64)
 
-        # Layer pairings for cross-layer KV sharing.
-        # If an Attention layer `layer_name` is in the keys of this dict, it
-        # means this layer will perform attention using the keys and values
-        # from the KV cache of `shared_kv_cache_layers[layer_name]`.
+        # --- KV 共享 ---
+        # 定义哪些层共享 KV 缓存
         self.shared_kv_cache_layers: dict[str, str] = {}
+        # 快速预填充模式下兼容的共享层
         self.kv_sharing_fast_prefill_eligible_layers: set[str] = set()
 
+        # 为快速预填充模式下的 KV 共享预分配索引张量
         self.kv_sharing_fast_prefill_logits_indices = None
         if self.cache_config.kv_sharing_fast_prefill:
             self.kv_sharing_fast_prefill_logits_indices = torch.zeros(
                 self.max_num_tokens, dtype=torch.int32, device=self.device
             )
 
+        # --- 均匀解码查询长度 ---
+        # 用于均匀解码批次大小的查询长度（考虑推测解码）
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
-        # Cudagraph dispatcher for runtime cudagraph dispatching.
+        # --- CUDA Graph 调度器 ---
+        # 用于运行时 CUDA Graph 的调度
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
+        # --- 多模态预算 ---
+        # 管理多模态资源的预算（如果支持多模态输入）
         self.mm_budget = (
             MultiModalBudget(self.vllm_config, self.mm_registry)
             if self.supports_mm_inputs
             else None
         )
 
+        # --- 批次重排序阈值 ---
+        # 用于决定何时对批次进行重排序的阈值
         self.reorder_batch_threshold: int | None = None
 
-        # Attention layers that are only in the KVCacheConfig of the runner
-        # (e.g., KV sharing, encoder-only attention), but not in the
-        # KVCacheConfig of the scheduler.
+        # --- 运行器专用注意力层 ---
+        # 只在运行器的 KVCacheConfig 中存在但在调度器中不存在的注意力层
         self.runner_only_attn_layers: set[str] = set()
 
-        # Cached outputs.
+        # --- 缓存输出和异步操作相关张量 ---
+        # 用于缓存推测解码相关的 token ID 和计数
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
-        # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
+        # N-gram GPU 路径的异步 D2H 缓冲区/事件
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
         self._num_valid_draft_tokens_event: torch.cuda.Event | None = None
@@ -803,7 +804,9 @@ class GPUModelRunner(
             self._num_valid_draft_tokens_copy_stream = torch.cuda.Stream()
 
         self._draft_token_req_ids: list[str] | None = None
+        # 用于协调 CPU-GPU 数据传输的事件
         self.transfer_event = torch.Event()
+        # 预分配的 CPU 张量，用于接收采样的 token IDs（固定内存）
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
             dtype=torch.int64,
@@ -811,18 +814,15 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
         )
 
-        # Pre-allocated tensor for copying valid sampled token counts to CPU,
-        # with dedicated stream for overlapping and event for coordination.
+        # 预分配张量和流，用于将验证的采样 token 计数和推测 token 异步复制到 CPU
         self.valid_sampled_token_count_event: torch.Event | None = None
         self.valid_sampled_token_count_copy_stream: torch.cuda.Stream | None = None
-        # We also copy the drafted tokens to the CPU asynchronously,
-        # in case we need them for structured outputs.
         self.draft_token_ids_event: torch.Event | None = None
         self.draft_token_ids_copy_stream: torch.cuda.Stream | None = None
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
-        if self.num_spec_tokens:
+        if self.num_spec_tokens: # 仅在启用推测解码时初始化这些
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
@@ -832,7 +832,7 @@ class GPUModelRunner(
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
-            if self.use_async_scheduling:
+            if self.use_async_scheduling: # 仅在启用异步调度时初始化这些
                 self.valid_sampled_token_count_event = torch.Event()
                 self.valid_sampled_token_count_copy_stream = torch.cuda.Stream()
                 self.valid_sampled_token_count_cpu = torch.empty(
@@ -842,15 +842,18 @@ class GPUModelRunner(
                     pin_memory=self.pin_memory,
                 )
 
-        # Model weight offloader
-        # Make sure this is called before any get_offloader call
+        # --- 模型权重卸载器 ---
+        # 创建并设置模型权重卸载器（用于节省显存）
         set_offloader(create_offloader(self.offload_config))
 
-        # Ephemeral state transferred between execute_model() and sample_tokens().
+        # --- 执行模型和采样之间的临时状态 ---
+        # 在 execute_model 和 sample_tokens 方法之间传递的状态
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        # 用于 Mamba 模型的状态索引和复制缓冲区
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        # 标记是否已注册每层的 NVTX 钩子（用于性能分析）
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -4758,11 +4761,11 @@ class GPUModelRunner(
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
-    @instrument(span_name="Loading (GPU)")
+    @instrument(span_name="Loading (GPU)")  # 分布式追踪：标记模型加载为观测跨度
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """
         Args:
-            load_dummy_weights: load dummy weights instead of real weights.
+            load_dummy_weights: 是否加载虚假权重（用于显存压力测试或 Profiling，避免磁盘 IO）
         """
         logger.info_once(
             "Starting to load model %s...",
@@ -4770,107 +4773,118 @@ class GPUModelRunner(
             scope="global",
         )
 
+        # --- 1. MoE 负载均衡初始化 ---
+        # 如果开启了专家并行负载均衡（针对 Mixtral/DeepSeek 等 MoE 架构）
         if self.parallel_config.enable_eplb:
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
 
         try:
-            with DeviceMemoryProfiler() as m:
+            # --- 2. 核心加载动作（带显存监控） ---
+            with DeviceMemoryProfiler() as m:  # 开启显存计时器，计算加载权重消耗了多少显存
                 time_before_load = time.perf_counter()
+                
+                # 策略选择：真实加载还是 Dummy 加载
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
+                
+                # 获取加载器（Loader）并执行加载动作
                 model_loader = get_model_loader(self.load_config)
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+
+                # 3. LoRA 适配器挂载
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+
+                # 4. 投机解码：草稿模型（Drafter）加载
                 if hasattr(self, "drafter"):
                     logger.info_once("Loading drafter model...")
+                    # 加载 Drafter（如小模型或 N-gram）并与主模型关联
                     self.drafter.load_model(self.model)
+                    
+                    # 如果 Drafter 也是 MoE 架构且开启了 EPLB，将其加入负载均衡管理
                     if (
                         hasattr(self.drafter, "model")
                         and is_mixture_of_experts(self.drafter.model)
                         and self.parallel_config.enable_eplb
                     ):
-                        assert not self.parallel_config.enable_elastic_ep, (
-                            "Elastic EP is not supported with drafter model."
-                        )
+                        assert not self.parallel_config.enable_elastic_ep, \
+                            "弹性 EP 不支持投机草稿模型"
+                        
                         spec_config = self.vllm_config.speculative_config
-                        assert spec_config is not None
-                        assert spec_config.draft_model_config is not None
-                        logger.info_once(
-                            "EPLB is enabled for drafter model %s.",
-                            spec_config.draft_model_config.model,
-                        )
+                        assert spec_config is not None and spec_config.draft_model_config is not None
+                        
+                        logger.info_once("EPLB is enabled for drafter model %s.", 
+                                        spec_config.draft_model_config.model)
+                        
                         if self.eplb_state is None:
-                            self.eplb_state = EplbState(
-                                self.parallel_config, self.device
-                            )
-                        self.eplb_state.add_model(
-                            self.drafter.model,
-                            spec_config.draft_model_config,
-                        )
+                            self.eplb_state = EplbState(self.parallel_config, self.device)
+                        self.eplb_state.add_model(self.drafter.model, spec_config.draft_model_config)
                         eplb_models += 1
 
+                # 5. EAGLE3 特性支持：辅助隐藏状态输出
+                # 某些投机解码方案（如 EAGLE）需要主模型输出中间层的隐藏状态
                 if self.use_aux_hidden_state_outputs:
                     if not supports_eagle3(self.get_model()):
-                        raise RuntimeError(
-                            "Model does not support EAGLE3 interface but "
-                            "aux_hidden_state_outputs was requested"
-                        )
+                        raise RuntimeError("该模型不支持 EAGLE3 要求的辅助隐藏状态接口")
 
-                    # Try to get auxiliary layers from speculative config,
-                    # otherwise use model's default layers
-                    aux_layers = self._get_eagle3_aux_layers_from_config()
-                    if aux_layers:
-                        logger.info(
-                            "Using auxiliary layers from speculative config: %s",
-                            aux_layers,
-                        )
-                    else:
-                        aux_layers = (
-                            self.model.get_eagle3_default_aux_hidden_state_layers()
-                        )
+                    # 获取需要“截断”输出的层索引
+                    aux_layers = self._get_eagle3_aux_layers_from_config() or \
+                                self.model.get_eagle3_default_aux_hidden_state_layers()
 
+                    # 在模型中注册这些 Hook，使其在 forward 时返回中间张量
                     self.model.set_aux_hidden_state_layers(aux_layers)
+                    
                 time_after_load = time.perf_counter()
+                
+            # 记录本次加载实际消耗的显存
             self.model_memory_usage = m.consumed_memory
+
+        # --- 6. 异常处理：解决显存焦虑 ---
         except torch.cuda.OutOfMemoryError as e:
             msg = (
-                "Failed to load model - not enough GPU memory. "
-                "Try lowering --gpu-memory-utilization to free memory for weights, "
-                "increasing --tensor-parallel-size, or using --quantization. "
-                "See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ "
-                "for more tips."
+                "模型加载失败 - 显存不足。建议：\n"
+                "1. 调低 --gpu-memory-utilization（给权重留空间）\n"
+                "2. 增加 --tensor-parallel-size（多卡均摊）\n"
+                "3. 使用 --quantization（量化压缩）"
             )
-            combined_msg = f"{msg} (original error: {e})"
+            combined_msg = f"{msg} (原始错误: {e})"
             logger.error(combined_msg)
             raise e
+
         logger.info_once(
             "Model loading took %s GiB memory and %.6f seconds",
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
             scope="local",
         )
+
+        # --- 7. 分布式通信缓冲准备 ---
         if not load_dummy_weights:
+            # 为 TP（张量并行）等通信算子预分配 Buffer（如 NCCL 使用的空间）
             prepare_communication_buffer_for_model(self.model)
-            if (drafter := getattr(self, "drafter", None)) and (
-                drafter_model := getattr(drafter, "model", None)
-            ):
+            if (drafter := getattr(self, "drafter", None)) and \
+            (drafter_model := getattr(drafter, "model", None)):
                 prepare_communication_buffer_for_model(drafter_model)
+
+        # --- 8. 多模态与视频配置 ---
         mm_config = self.model_config.multimodal_config
+        # 是否支持多模态剪枝（减少视觉 Token 数量）
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
             and mm_config is not None
             and mm_config.is_multimodal_pruning_enabled()
         )
+        # 视频处理的临时补丁：是否需要强制顺序编码
         self.requires_sequential_video_encoding = hasattr(
             self.get_model(), "requires_sequential_video_encoding"
-        )  # Temporary hack for dynamic res video w/o support for bs>1 yet
+        )
 
+        # --- 9. 启动 MoE 负载均衡器循环 ---
         if (
             is_mixture_of_experts(self.model)
             and self.parallel_config.enable_eplb
@@ -4878,44 +4892,38 @@ class GPUModelRunner(
         ):
             logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
             assert self.eplb_state is not None
-            self.eplb_state.add_model(
-                self.model,
-                self.model_config,
-            )
+            self.eplb_state.add_model(self.model, self.model_config)
+            # 如果是异步 EPLB，开启后台线程动态调整专家路由
             if self.eplb_state.is_async:
                 self.eplb_state.start_async_loop()
 
-        if (
-            self.vllm_config.compilation_config.mode
-            == CompilationMode.STOCK_TORCH_COMPILE
-        ):
+        # --- 10. 编译与性能封装 ---
+        # 情况 A: 原生 torch.compile 模式
+        if (self.vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE):
             backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)
             compilation_counter.stock_torch_compile_count += 1
             self.model.compile(fullgraph=True, backend=backend)
             return
-        # for other compilation modes, cudagraph behavior is controlled by
-        # CudagraphWrapper and CudagraphDispatcher of vllm.
 
-        # wrap the model with full cudagraph wrapper if needed.
+        # 情况 B: 使用 CUDA Graph 封装（vLLM 性能的关键）
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
-        if (
-            cudagraph_mode.has_full_cudagraphs()
-            and not self.parallel_config.use_ubatching
-        ):
+        
+        # 如果开启了全量 CUDA Graph 且没有使用 UBatching
+        if (cudagraph_mode.has_full_cudagraphs() and not self.parallel_config.use_ubatching):
+            # 封装模型：允许录制并回放计算图，绕过 Python 解释器开销
             self.model = CUDAGraphWrapper(
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
             )
+        # 情况 C: 使用 UBatching（微批处理，优化流水线气泡）
         elif self.parallel_config.use_ubatching:
-            if cudagraph_mode.has_full_cudagraphs():
-                self.model = UBatchWrapper(
-                    self.model, self.vllm_config, CUDAGraphMode.FULL, self.device
-                )
-            else:
-                self.model = UBatchWrapper(
-                    self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
-                )
+            self.model = UBatchWrapper(
+                self.model, self.vllm_config, 
+                CUDAGraphMode.FULL if cudagraph_mode.has_full_cudagraphs() else CUDAGraphMode.NONE, 
+                self.device
+            )
 
+        # 最后，初始化权重卸载器（Offloader）的后置逻辑
         get_offloader().post_init()
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:

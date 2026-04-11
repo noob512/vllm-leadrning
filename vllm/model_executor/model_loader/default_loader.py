@@ -41,48 +41,60 @@ logger = init_logger(__name__)
 
 
 class DefaultModelLoader(BaseModelLoader):
-    """Model loader that can load different file types from disk."""
+    """能够从磁盘加载不同文件类型的通用模型加载器。"""
 
-    # default number of thread when enable multithread weight loading
+    # 启用多线程加载权重时的默认线程数
+    # 加载大模型（如 70B）时，IO 往往是瓶颈，多线程可以显著缩短冷启动时间
     DEFAULT_NUM_THREADS = 8
 
     @dataclasses.dataclass
     class Source:
-        """A source for weights."""
+        """
+        定义权重的来源元数据。
+        
+        这个内部类非常关键，因为它抽象了“权重在哪里”以及“怎么取”。
+        """
 
-        model_or_path: str
-        """The model ID or path."""
+        model_or_path: str  # 模型在 HuggingFace 的 ID 或本地绝对路径
+        revision: str | None  # Git 版本号（HF 专用，如 'main' 或某个 commit hash）
+        subfolder: str | None = None  # 如果权重在仓库的子目录下（例如 'model/weights'）
+        
+        prefix: str = ""  
+        # 权重名称前缀。这在投机解码中很有用，
+        # 例如给草稿模型的权重名统一加上 "drafter." 前缀以防冲突。
 
-        revision: str | None
-        """The optional model revision."""
+        fall_back_to_pt: bool = True  
+        # 是否允许回退到 PyTorch (.bin/.pt) 格式。
+        # 如果为 True，当找不到 .safetensors 时，会尝试加载传统的 pickle 格式。
 
-        subfolder: str | None = None
-        """The subfolder inside the model repo."""
+        allow_patterns_overrides: list[str] | None = None  
+        # 模式覆盖。如果定义了，加载器将只加载匹配这些 Glob 模式的文件。
 
-        prefix: str = ""
-        """A prefix to prepend to all weights."""
-
-        fall_back_to_pt: bool = True
-        """Whether .pt weights can be used."""
-
-        allow_patterns_overrides: list[str] | None = None
-        """If defined, weights will load exclusively using these patterns."""
-
+    # 用于性能遥测：记录加载前后的时候，以便计算纯加载耗时
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        
+        # 专家并行（MoE）专用：
+        # 如果是 MoE 模型，当前 GPU 可能只负责部分“专家”。
+        # 这里记录当前节点需要加载的专家 ID 集合。
         self.local_expert_ids: set[int] | None = None
 
+        # --- 额外的配置校验 ---
         extra_config = load_config.model_loader_extra_config
+        
+        # 默认加载器目前只允许两个“额外选项”：是否开启多线程以及线程数
         allowed_keys = {"enable_multithread_load", "num_threads"}
+        
+        # 找出用户传入的、但不属于上述范围的非法参数
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
         if unexpected_keys:
+            # 严格校验：防止用户在配置中写错单词（如把 num_threads 写成 threads）
             raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: "
+                f"对于加载格式 {load_config.load_format}，存在不支持的额外配置项: "
                 f"{unexpected_keys}"
             )
 
