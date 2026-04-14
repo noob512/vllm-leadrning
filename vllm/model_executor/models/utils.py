@@ -619,38 +619,61 @@ class PPMissingLayer(torch.nn.Identity):
 
 def make_layers(
     num_hidden_layers: int,
-    layer_fn: LayerFn,
+    layer_fn: LayerFn,  # 这是一个工厂函数，传入前缀字符串，它会吐出一个实例化的网络层（如 LlamaDecoderLayer）
     prefix: str,
 ) -> tuple[int, int, torch.nn.ModuleList]:
-    """Make a list of layers with the given layer function, taking
-    pipeline parallelism into account.
+    """
+    在考虑流水线并行 (Pipeline Parallelism) 的情况下，使用给定的层构建函数生成一个层的列表。
+
+    核心思想：
+    如果一个拥有 32 层的模型被分摊到 4 张 GPU 上运行（流水线并行度 PP=4），
+    那么当前 GPU 没必要、也不应该把 32 层全实例化出来（会爆显存）。
+    当前 GPU 只需要实例化属于它自己的那 8 层。为了保持索引的一致性，其余的层用一个不占内存的空壳占位。
 
     Args:
-        num_hidden_layers: Total number of hidden layers in the model.
-        layer_fn: Function to create a layer given its index.
-        prefix: Prefix for layer names.
+        num_hidden_layers: 模型的总隐藏层数（例如 LLaMA-7B 通常是 32）。
+        layer_fn: 层的构造函数，根据索引和前缀实例化具体的层。
+        prefix: 层名称的前缀，用于后续加载权重时的字典映射（如 "model.layers"）。
 
     Returns:
-        Tuple of (start_layer, end_layer, modules).
+        返回一个元组：(当前GPU负责的起始层索引, 结束层索引, 包含所有层(含占位符)的 ModuleList)。
     """
+    # 导入 vLLM 分布式状态和工具函数
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
+    # 导入卸载器管理器
     from vllm.model_executor.offloader import get_offloader
 
+    # --- 1. 计算当前 GPU 的责任区间 ---
+    # 根据总层数、当前 GPU 在流水线组中的排名 (rank) 以及流水线组的总大小 (world_size)，
+    # 计算出当前 GPU 需要负责的层的范围 [start_layer, end_layer)。
+    # 举例：共32层，PP=4，当前是第1张卡（rank 1），则计算得出 start_layer=8, end_layer=16。
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
 
+    # --- 2. 组装 ModuleList ---
+    # PyTorch 的 nn.ModuleList 要求可以通过索引访问层 (如 model.layers[15])。
+    # 为了保证代码逻辑的通用性，列表的长度依然是 num_hidden_layers (比如32)，
+    # 但里面的内容被分成了三段：
     modules = torch.nn.ModuleList(
+        # 【第一段】：在当前 GPU 责任范围之前的层 -> 填入不占显存的空壳 (PPMissingLayer)
+        # 例如对于 rank 1 来说，层 0-7 都在上一张卡上，当前卡不需要，放空壳。
         [PPMissingLayer() for _ in range(start_layer)]
+        
+        # 【第二段】：当前 GPU 真正需要负责计算的层 -> 真实实例化，并执行 Offload 拦截！
         + get_offloader().wrap_modules(
+            # 遍历责任区间，利用工厂函数 layer_fn 实例化出真实的 Transformer 层
             layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
         )
+        
+        # 【第三段】：在当前 GPU 责任范围之后的层 -> 填入不占显存的空壳 (PPMissingLayer)
+        # 例如对于 rank 1 来说，层 16-31 都在后面的卡上，放空壳。
         + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
     )
 
+    # 返回责任边界和组装好的列表，供模型类（如 LlamaModel）保存
     return start_layer, end_layer, modules
-
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection
 _model_to_pp_missing_layer_names: dict[int, list[str]] = {}

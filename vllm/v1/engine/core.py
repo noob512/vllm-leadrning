@@ -234,47 +234,71 @@ class EngineCore:
         # 缓存环境变量，避免运行时高频调用 os.environ（这是慢速系统调用）
         enable_envs_cache()
 
-    @instrument(span_name="Prepare model")
+    @instrument(span_name="Prepare model") # 分布式追踪：记录准备模型阶段（探查、分配显存、预热）的耗时
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
         start = time.time()
 
-        # Get all kv cache needed by the model
+        # =========================================================================
+        # 阶段 1：获取模型的 KV Cache 需求规格
+        # =========================================================================
+        # 询问模型执行器：“这个模型需要什么格式的 KV Cache？”
+        # 返回的 specs 包含了数据类型（如 FP16）、每层注意力机制的头数、Block 大小等元数据。
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
+        # 检查当前模型是否真的需要 KV Cache
+        # 绝大多数 Transformer 模型都需要，但某些“无注意力机制”的模型（如 Mamba、RNN类）可能不需要。
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
+        
+        # =========================================================================
+        # 阶段 2：显存压力精算（Memory Profiling） - 极其关键！
+        # =========================================================================
         if has_kv_cache:
+            # 这是一个针对特定弹性扩展环境（Elastic EP）的特殊分支，通常可以忽略。
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
-                # NOTE(yongji): should already be set
-                # during _eep_scale_up_before_kv_init
+                # NOTE(yongji): should already be set during _eep_scale_up_before_kv_init
                 assert self.available_gpu_memory_for_kv_cache > 0
-                available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
-                    kv_cache_specs
-                )
+                available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(kv_cache_specs)
             else:
-                # Profiles the peak memory usage of the model to determine how
-                # much memory can be allocated for kv cache.
+                # 【核心探查逻辑】：计算到底还剩多少显存可以给 KV Cache 挥霍。
+                # 这里底层会模拟跑一次“假推理（Dummy Forward）”，计算出：
+                # 剩余可用显存 = GPU总显存 - 模型权重占比 - 临时激活值（Activations）占比 - PyTorch上下文开销
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
             # Attention free models don't need memory for kv cache
+            # 如果不需要 KV Cache，可用显存直接记为 0
             available_gpu_memory = [0] * len(kv_cache_specs)
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
-        # Track max_model_len before KV cache config to detect auto-fit changes
+        # =========================================================================
+        # 阶段 3：计算并分配物理 Block (包含 Auto-fit 机制)
+        # =========================================================================
+        # 记录配置中原本设定的最大上下文长度（例如用户启动时设定了 32000）
         max_model_len_before = vllm_config.model_config.max_model_len
 
+        # 基于刚才探查出的真实可用显存，结合 KV Cache 的规格，计算出：
+        # 1. 显卡到底能装下多少个 Block (num_gpu_blocks)
+        # 2. 【Auto-fit 机制】：如果剩下的显存实在太小，连用户要求的 max_model_len 都满足不了，
+        #    这个函数会在底层悄悄把 max_model_len 缩小（比如从 32k 砍到 16k），以防止后续运行时发生 OOM。
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
 
-        # If auto-fit reduced max_model_len, sync the new value to workers.
-        # This is needed because workers were spawned before memory profiling
-        # and have the original (larger) max_model_len cached.
+        # =========================================================================
+        # 阶段 4：多卡状态同步
+        # =========================================================================
+        # 获取经过 Auto-fit 调整后的最新 max_model_len
         max_model_len_after = vllm_config.model_config.max_model_len
+        
+        # 如果系统为了防爆显存，强行缩小了最大长度...
         if max_model_len_after != max_model_len_before:
+            # 【RPC 广播】：因为之前在初始化多卡分布式 Worker 时，大家脑子里记的还是旧的、较大的长度。
+            # 这里必须通过网络 RPC 调用，强制让所有显卡上的进程统一把阈值调小。
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
+        # 将底层的缓存配置转换给调度器（Scheduler）使用
+        # 调度器后续在处理请求时，需要知道总共有多少个 Block 可以用来做 PagedAttention 分配。
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
@@ -283,17 +307,25 @@ class EngineCore:
                 g.kv_cache_spec.block_size for g in kv_cache_groups
             )
 
+        # 再次校验 block_size 是否合法（比如必须是 16 的倍数等）
         vllm_config.validate_block_size()
 
-        # Initialize kv cache and warmup the execution
+        # =========================================================================
+        # 阶段 5：正式圈地与预热（Warmup）
+        # =========================================================================
+        # 拿着刚才计算好的配置清单，去显卡上真正申请那一整块巨大无比的 KV Cache 显存池。
+        # 同时，在这里通常会触发 CUDA Graph 的捕捉预热（Warmup）：
+        # 系统会用不同的 Batch Size 空跑几遍模型，把底层的算子调用图记录下来，极大加速后续的真实推理。
         self.model_executor.initialize_from_config(kv_cache_configs)
 
+        # 记录耗时并打印日志
         elapsed = time.time() - start
         logger.info_once(
             "init engine (profile, create kv cache, warmup model) took %.2f seconds",
             elapsed,
             scope="local",
         )
+        
         return scheduler_kv_cache_config
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:

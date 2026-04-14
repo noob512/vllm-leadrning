@@ -353,43 +353,80 @@ def llama_model_invariants(
     shape_invariants=llama_model_invariants
 )
 class LlamaModel(nn.Module, EagleModelMixin):
+    """
+    LLaMA 模型的主干网络 (Backbone)。
+    它继承自 PyTorch 的 nn.Module，并且混入了 EagleModelMixin（可能用于支持类似 Eagle 这样的投机解码算法）。
+    这个类主要负责构建 LLaMA 模型的词嵌入层、多层解码器 (Decoder Layers) 和最终的层归一化 (RMSNorm)。
+    由于 vLLM 支持张量并行 (Tensor Parallelism) 和流水线并行 (Pipeline Parallelism)，
+    这里的代码大量考虑了模型在多 GPU 切分情况下的构建逻辑。
+    """
     def __init__(
         self,
         *,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-        layer_type: type[nn.Module] = LlamaDecoderLayer,
+        vllm_config: VllmConfig, # vLLM 全局配置大对象，包含模型结构、缓存配置等
+        prefix: str = "",        # 模块名称前缀，用于复杂嵌套模型时标识该模块在模型树中的路径
+        layer_type: type[nn.Module] = LlamaDecoderLayer, # 组成堆叠层的基本单元类，默认是 LlamaDecoderLayer
     ):
+        # 初始化父类 nn.Module
         super().__init__()
 
+        # --- 1. 提取基础配置 ---
+        # 从 vLLM 的全局配置中提取 HuggingFace 风格的模型结构配置 (如 hidden_size, num_layers 等)
         config = vllm_config.model_config.hf_config
+        # 提取量化配置（如果是 AWQ/GPTQ 等量化模型，会有对应的配置信息）
         quant_config = vllm_config.quant_config
 
         self.config = config
         self.quant_config = quant_config
 
+        # 记录词表大小
         self.vocab_size = config.vocab_size
 
+        # --- 2. 构建词嵌入层 (Embedding Layer) 结合流水线并行 (Pipeline Parallelism, PP) 逻辑 ---
+        # 在流水线并行中，模型按层切分到不同的 GPU。通常，只有第一张卡 (First Rank) 需要词嵌入层将 input_ids 转为向量。
+        # 如果模型配置了 `tie_word_embeddings=True`（即输入嵌入层和最后的输出预测层共享权重），
+        # 那么最后一张卡 (Last Rank) 也需要有这个词嵌入层，以便在输出时将其用作 LM Head (通常通过转置实现预测)。
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
         ):
+            # 构建词表并行的嵌入层 (VocabParallelEmbedding)
+            # 在张量并行 (TP) 下，词表可能被切分到不同的卡上，这个类处理了这种切分情况。
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
             )
         else:
+            # 如果当前 GPU 既不是第一层所在的卡，（在不共享权重时）也不是最后一张卡，
+            # 那么它不需要词嵌入层，这里放一个占位符 `PPMissingLayer()`，表示该层在当前流水线阶段缺失，从而节省显存。
             self.embed_tokens = PPMissingLayer()
+
+        # --- 3. 构建核心解码器层 (Decoder Layers) 结合流水线并行逻辑 ---
+        # `make_layers` 是 vLLM 的一个辅助工具函数，专门用来构建并在流水线中分配这些层。
+        # 它会根据当前的 PP Rank，决定从 `config.num_hidden_layers` 中切分出哪几个层给当前 GPU。
+        # 比如一共 32 层，分 2 张卡 PP，卡 0 会拿到 layer 0-15，卡 1 会拿到 layer 16-31。
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
+            # 使用 lambda 表达式动态生成具体的 Transformer 层实例
             lambda prefix: layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+
+        # --- 4. 构建最终层归一化 (Final RMSNorm) 结合流水线并行逻辑 ---
+        # 在 Transformer 结构中，经过所有 Decoder 层后，最后通常会有一个 LayerNorm/RMSNorm。
+        # 显然，这个操作应该发生在所有隐藏层都执行完之后，所以只分配给流水线中的最后一张卡 (Last Rank)。
         if get_pp_group().is_last_rank:
+            # LLaMA 使用 RMSNorm 作为归一化方法
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
+            # 中间卡的流水线阶段不需要执行最终的 Norm，用占位符替代
             self.norm = PPMissingLayer()
 
+        # --- 5. 准备中间张量工厂 (Intermediate Tensors Factory) ---
+        # 这是一个用于 vLLM 内部执行图优化的工具。
+        # 当使用类似 `forward_with_intermediate` 的机制时，需要分配空的张量来暂时存放
+        # 中间的隐藏状态 ("hidden_states") 和残差连接 ("residual")。
+        # 这个工厂方法记录了它们的名字和维度要求，以便在后续 forward 时按需快速生成。
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )

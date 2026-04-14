@@ -6271,36 +6271,66 @@ class GPUModelRunner(
             self.attn_groups.append(create_attn_groups(attn_backend_map, i))
 
     def initialize_metadata_builders(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+    self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> None:
         """
         Create the metadata builders for all KV cache groups and attn groups.
+        为所有的 KV 缓存组和注意力组创建“元数据构建器（页表印表机）”。
         """
+        
+        # 【任务 1：为各个算子组安装“印表机”】
+        # 遍历所有的 KV Cache 组（通常标准大模型只有 1 组，但多模态或 MLA 架构可能有两组以上）
         for kv_cache_group_id in range(len(kv_cache_config.kv_cache_groups)):
+            
+            # 遍历该缓存组下的所有注意力计算组 (Attention Groups)
+            # 注意力组封装了底层的具体算子（如 FlashAttention, PagedAttention 等）
             for attn_group in self.attn_groups[kv_cache_group_id]:
+                
+                # 为这个具体的算子组实例化它的专属 Builder
                 attn_group.create_metadata_builders(
                     self.vllm_config,
-                    self.device,
+                    self.device,  # 绑定当前的 GPU 设备
+                    
+                    # 传入我们上一节讲到的，为了迎合硬件而切分好的“底层物理 Block 大小” (比如 64)
                     kernel_block_sizes[kv_cache_group_id]
                     if kv_cache_group_id < len(kernel_block_sizes)
                     else None,
+                    
+                    # 💡【前沿特性：uBatching (微批处理/Chunked Prefill)】
+                    # 如果开启了 ubatching（把一个超长的 Prompt 切成好几段来算，防止卡死 GPU），
+                    # 那么系统在同一时刻会有多个微批次在流水线上跑。
+                    # 此时，1 台印表机不够用了，必须给每个微批次分配一台专属的印表机（num_ubatches）。
                     num_metadata_builders=1
                     if not self.parallel_config.use_ubatching
                     else self.parallel_config.num_ubatches,
                 )
+
+        # 【任务 2：计算重排阈值 (Reorder Batch Threshold)】
         # Calculate reorder batch threshold (if needed)
         # Note (tdoublep): do this *after* constructing builders,
         # because some of them change the threshold at init time.
+        
+        # 💡 这是一个针对特定算子（如 FlashInfer）的极客优化：
+        # 当一批用户的句子长度差异极大（有人 10 个词，有人 2000 个词）时，
+        # 算子在底层可能需要对这些请求进行“重排（Reorder）”以达到最高算力利用率。
+        # 这里之所以必须放在 Builder 创建【之后】执行，是因为某些刁钻的算子在初始化 Builder 时，
+        # 会根据显卡的硬件状态动态修改这个重排阈值，所以必须等它们就绪后再统账。
         self.calculate_reorder_batch_threshold()
 
+        # 【任务 3：为推测解码（小模型）安装专属系统】
         # Initialize drafter attention backend
+        # 如果开启了推测解码（Eagle / Medusa / Draft Model）...
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
+            # 确认当前使用的推测模型类型
             assert isinstance(
                 self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
             )
+            # 让“小模型（草稿模型）”也去初始化它自己的底层注意力引擎和元数据系统。
+            # 因为在推测解码中，大模型和小模型是共享底层的 KV Cache 池的，
+            # 小模型也必须有一套自己的“印表机”来生成物理指针，并且要和大模型对齐（kernel_block_sizes）。
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
     def _check_and_update_cudagraph_mode(
@@ -6759,23 +6789,24 @@ class GPUModelRunner(
                 )
 
     def initialize_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+    self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
-
-        Args:
-            kv_cache_config: The KV cache config
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
-
-        Returns:
-            Dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
+        【核心目的】：在显存中真正分配 KV Cache 的张量（Tensors），
+        并返回一个字典，把每一层的名字（如 layer_0）和它对应的物理显存池绑定起来。
         """
 
-        # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
+        
+        # 【设计 1：VIP 快速通道（专为分布式传输优化）】
+        # 检查当前模型的所有层是不是长得都一样（Uniform）？
+        # 市面上 99% 的大模型（Llama, Qwen）每一层的头数和维度都是一致的。
         if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
+            # 如果是一致的，走 VIP 快速通道分配内存。
+            # 这个底层函数不仅会分配显存，还会刻意保证这些显存在物理地址上是【绝对连续】的。
+            # 为什么要连续？因为我们在上一节提到了“跨机器 KV 传输（Disaggregated Serving）”。
+            # 网卡（RDMA）在底层进行光速传输时，最喜欢连续的物理内存。
             kv_caches, cross_layers_kv_cache, attn_backend = (
                 self.allocate_uniform_kv_caches(
                     kv_cache_config,
@@ -6788,29 +6819,47 @@ class GPUModelRunner(
             self.cross_layers_kv_cache = cross_layers_kv_cache
             self.cross_layers_attn_backend = attn_backend
         else:
-            # Fallback to the general case
-            # Initialize the memory buffer for KV cache
+            # 【设计 2：通用降级通道（Fallback）】
+            # 如果模型是个“缝合怪”（比如某些层维度大，某些层维度小），就走通用逻辑。
+            
+            # 第一步：不管三七二十一，先按总字节数申请一块巨大无比的“一维”原始显存。
+            # 🚀 真正调用 torch.empty(..., device="cuda") 的地方就在这个函数里！
             kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
 
-            # Change the memory buffer to the desired shape
+            # 第二步：把这块平坦的一维显存，像揉面团一样，揉捏（Reshape）成底层算子需要的形状。
+            # 这里用到了上一节传进来的 kernel_block_sizes。
+            # 最终形状通常是高维的，例如：[num_blocks, num_heads, head_dim, block_size]
             kv_caches = self._reshape_kv_cache_tensors(
                 kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes
             )
 
-        # Set up cross-layer KV cache sharing
+        # 【设计 3：极致省显存黑科技（跨层 KV 共享）】
+        # 针对类似 DeepSeek V2/V3 使用的 MLA（多头潜在注意力）等架构。
+        # 这种架构下，可能有好几层网络完全共享同一个 KV Cache，以此极大地节省显存。
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
+            # Python 的字典魔法：不重新分配显存，直接让当前层的指针，指向目标层的物理显存地址。
+            # 两人共用一套房子！
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
+        # 兼容一个极其特殊的内部/实验性模型结构 (longcat_flash)，它每层有两个 Attention 模块
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )
+        
+        # 【设计 4：将显存池接入“总电网”（绑定静态上下文）】
+        # 显存虽然分配好了，但在 vLLM 中，推理往往是由 CUDA Graph（计算图）接管的。
+        # CUDA Graph 运行时是不允许动态申请内存的，它必须有一个固定的、静态的内存池。
+        # bind_kv_cache 的作用，就是把刚刚抠出来的几十 GB 物理指针，
+        # 像插头一样，死死地插进模型的“静态前向传播上下文（static_forward_context）”中。
         bind_kv_cache(
             kv_caches,
             self.compilation_config.static_forward_context,
             self.kv_caches,
             num_attn_module,
         )
+        
+        # 交房！返回包含所有层显存指针的字典。
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -6842,59 +6891,97 @@ class GPUModelRunner(
                     break
 
     def initialize_kv_cache(
-        self,
-        kv_cache_config: KVCacheConfig,
-        is_profiling: bool = False,
+    self,
+    kv_cache_config: KVCacheConfig,
+    is_profiling: bool = False,
     ) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
-        Args:
-            kv_cache_config: Configuration for the KV cache, including the KV
-            cache size of each layer
+        根据配置表，真正地在底层显存中实例化 KV Cache，并绑定相关的 CUDA 计算引擎。
         """
+        
+        # 【阶段 1：环境清理与前置准备】
+        # 深拷贝配置，防止后续修改污染了全局配置
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        
+        # Mamba 模型（SSM架构，非 Transformer）专属的缓存清理
         self._mamba_copy_bufs = None
+        
+        # 兼容多模态模型（如含有 Encoder 的视觉/语音模型）的缓存需求
         self.may_add_encoder_only_layers_to_kv_cache_config()
+        
+        # 兼容像 DeepSeek 这种采用了 MLA（跨层 KV 共享）或 Cross-Layer Attention 的高级架构
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+
+        # 【阶段 2：点亮底层计算引擎 (Attention Backend)】
+        # 这是 vLLM 性能极速的核心！
+        # 根据你的显卡型号（A100/H100/RTX4090）和数据类型（FP16/FP8），
+        # 决定到底是用 FlashAttention、XFormers 还是 vLLM 自己写的 PagedAttention 算子。
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
-        # The kernel block size for all KV cache groups. For example, if
-        # kv_cache_manager uses block_size 256 for a given group, but the attention
-        # backends for that group only supports block_size 64, we will return
-        # kernel_block_size 64 and split the 256-token-block to 4 blocks with 64
-        # tokens each.
+
+        # 【阶段 3：软硬件物理几何对齐 (极其关键的底层细节)】
+        # The kernel block size for all KV cache groups. 
+        # For example, if kv_cache_manager uses block_size 256 for a given group, 
+        # but the attention backends for that group only supports block_size 64, 
+        # we will return kernel_block_size 64 and split the 256-token-block 
+        # to 4 blocks with 64 tokens each.
+        
+        # 💡 翻译一下上面的官方注释：
+        # 上层的调度器（Scheduler）为了管理方便，可能决定 1 个逻辑 Block 包含 256 个 Token。
+        # 但底层的 FlashAttention 算子在写 C++ 层面时，为了硬件对齐，可能最多只能处理 64 个 Token 的物理块。
+        # 这个函数负责“化整为零”：把 1 个 256 的逻辑大块，在底层切分成 4 个 64 的物理小块。
+        # 这样既满足了上层的高效管理，又迎合了底层算子的严苛要求。
         kernel_block_sizes = prepare_kernel_block_sizes(
             kv_cache_config, self.attn_groups
         )
         self._kernel_block_sizes = kernel_block_sizes
 
-        # create metadata builders
+        # 【阶段 4：正式分配显存与元数据机制】
+        # 创建“元数据生成器”。在以后的每一次推理中，它负责把复杂的虚拟/物理地址映射关系
+        # 翻译成底层的 Block Tables 指针，喂给 CUDA 算子。
         self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
 
-        # Reinitialize need to after initialize_attn_backend
+        # 重置输入批次处理的相关状态
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+        
+        # 🚀【真正干苦力活的地方】
+        # 就是在这个函数里面，终于调用了 torch.empty(...)，
+        # 在刚才设定的 "kv_cache" 专属显存池里，真正划出了几十 GB 的张量！
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
 
+        # 【阶段 5：前沿黑科技生态对接】
+        
+        # 黑科技 A：推测解码（Speculative Decoding）支持
+        # 如果开启了类似 Eagle/Medusa 这种用“小模型猜、大模型验证”的技术...
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)
-            # validate all draft model layers belong to the same kv cache
-            # group
+            # 验证草稿模型（小模型）的 KV Cache 组是否与主模型完美对齐，防止显存指针错乱。
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
 
+        # 黑科技 B：分布式 KV 传输（Disaggregated Serving）支持
+        # 我们上一节提到过，不同物理机之间可以通过网络互传 KV Cache。
         if has_kv_transfer_group() and not is_profiling:
             kv_transfer_group = get_kv_transfer_group()
+            
             if self.cross_layers_kv_cache is not None:
+                # 针对带跨层共享架构的特殊处理
                 assert self.cross_layers_attn_backend is not None
                 kv_transfer_group.register_cross_layers_kv_cache(
                     self.cross_layers_kv_cache, self.cross_layers_attn_backend
                 )
             else:
+                # 常规架构处理：
+                # 把刚刚分配好的 kv_caches（几十GB显存的物理指针）注册到网络传输组中（如 NCCL 或 RDMA）。
+                # 这样这块显存就变成了一块“网卡可以直接读写的共享内存（Zero-copy）”。
                 kv_transfer_group.register_kv_caches(kv_caches)
+                
+            # 设置底层的传输回调函数
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
     def _get_attention_kv_cache_gid(self) -> int:

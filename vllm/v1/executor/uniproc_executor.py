@@ -294,12 +294,39 @@ class ExecutorWithExternalLauncher(UniProcExecutor):
         local_rank = int(os.environ["LOCAL_RANK"])
         return distributed_init_method, rank, local_rank
 
-    def determine_available_memory(self) -> list[int]:  # in bytes
+    def determine_available_memory(self) -> list[int]:  # 返回单位为 bytes 的列表
+        # 作者留下的核心注释：我们需要获取所有显卡（ranks）中，可用显存最小的那个值。
         # we need to get the min across all ranks.
+        
+        # 【步骤 1：本地极限压测】
+        # 调用父类（或底层实现）的方法。
+        # 这里就是上节我们提到的：清空本地缓存、跑 Dummy Forward 假推理、查验 max_memory_allocated，
+        # 最终算出“我这张卡”当前还剩多少显存（比如 memory = 15 GB）。
         memory = super().determine_available_memory()
+        
+        # 导入 vLLM 自己封装的分布式状态管理模块
         from vllm.distributed.parallel_state import get_world_group
 
+        # 【步骤 2：获取通讯局域网】
+        # 获取专用的 CPU 分布式通信组 (Process Group)。
+        # 为什么用 CPU 组而不是 GPU？因为当前我们正在“精确测量 GPU 显存”，
+        # 如果此时为了通信又在 GPU 上创建张量，会污染测量结果。所以把通信任务交给 CPU。
         cpu_group = get_world_group().cpu_group
+        
+        # 【步骤 3：数据打包准备通信】
+        # 把刚刚算出来的、自己这张卡的显存剩余量（Python 的 int 数字），
+        # 打包成一个 PyTorch 的 CPU 张量 (Tensor)，因为底层的分布式通信只认 Tensor。
         memory_tensor = torch.tensor([memory], device="cpu", dtype=torch.int64)
+        
+        # 【步骤 4：核心魔法！分布式规约 (All-Reduce)】
+        # 这是一行极其强大的 PyTorch 分布式操作：
+        # 1. 它会让当前所有的 Worker 进程在这里“集合（Barrier）”停下。
+        # 2. 把大家手里的 memory_tensor 全部收上来。
+        # 3. 执行 ReduceOp.MIN 操作（挑出所有人里面最小的那个数字）。
+        # 4. 把挑出来的这个最小值，【重新覆盖】写入到每个 Worker 自己的 memory_tensor 中。
         dist.all_reduce(memory_tensor, group=cpu_group, op=dist.ReduceOp.MIN)
+        
+        # 【步骤 5：解包返回】
+        # 经过上一步，此时每个 Worker 手里的 memory_tensor.item() 都变成了那个“全网最低值”。
+        # 拆包成 Python 数字，放在列表里返回。
         return [memory_tensor.item()]

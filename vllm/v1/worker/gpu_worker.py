@@ -401,70 +401,73 @@ class Worker(WorkerBase):
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
 
-    @torch.inference_mode()
+    @torch.inference_mode() # 强制关闭梯度计算，这在推理阶段是必须的，能节省大量显存和算力
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
-
-        The engine will first conduct a profiling of the existing memory usage.
-        Then, it calculates the free memory that can be used for KV cache in
-        bytes.
-
-        Tip:
-            You may limit the usage of GPU memory
-            by adjusting the `gpu_memory_utilization` parameter.
+        【整体逻辑】先对现有的显存使用情况进行一次摸底（Profiling），
+        然后通过做减法，算出还有多少字节（bytes）可以分给 KV Cache。
         """
+        
+        # =========================================================================
+        # 阶段 1：手动接管模式（Manual Override）
+        # =========================================================================
+        # 如果用户在启动配置中强行指定了 KV Cache 的绝对大小（以字节为单位）
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
+            # 即使强行指定了大小，依然需要跑一次“假推理（Profile Run）”。
+            # 因为底层的 CUDA 算子或计算图（CUDA Graphs）需要借助这次假推理来完成编译和预热。
             self.model_runner.profile_run()
 
-            msg = (
-                f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
-                f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
-                "KV Cache as specified by kv_cache_memory_bytes config and "
-                "skipped memory profiling. This does not respect the "
-                "gpu_memory_utilization config. Only use kv_cache_memory_bytes "
-                "config when you want manual control of KV cache memory "
-                "size. If OOM'ed, check the difference of initial free "
-                "memory between the current run and the previous run "
-                "where kv_cache_memory_bytes is suggested and update it "
-                "correspondingly."
-            )
+            # 打印日志警告用户：你正在使用手动控制模式，
+            # 引擎将忽略 --gpu-memory-utilization（默认 0.9）这个参数。
+            # 如果爆显存了，请自己对比两次运行的日志来微调这个值。
+            msg = ( ... ) # 省略长字符串提示
             logger.info(msg)
             return kv_cache_memory_bytes
 
-        # Execute a forward pass with dummy inputs to profile the memory usage
-        # of the model.
+        # =========================================================================
+        # 阶段 2：模拟压测（Dummy Profiling）- 获取动态激活显存峰值
+        # =========================================================================
+        # Execute a forward pass with dummy inputs to profile the memory usage of the model.
+        # 开启显存追踪的上下文管理器。它会记录压测开始前的显存快照。
         with memory_profiling(
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            # 【核心动作】：用极限大小的假数据（最大 Batch Size，最大长度）跑一次完整的前向传播。
             self.model_runner.profile_run()
 
+            # 向 PyTorch 底层查询：在刚才那次假推理中，显存占用“瞬间飙到的最高点（Peak）”是多少？
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
             )
 
-            # Profile CUDA graph memory if graphs will be captured.
-            # Skip on ROCm/HIP as graph pool handles and mem_get_info behave
-            # differently and can produce incorrect/negative estimates.
+            # =========================================================================
+            # 阶段 3：CUDA Graph 开销预估
+            # =========================================================================
+            # CUDA Graph 会把计算图刻录在显卡上，这本身也会吃掉一部分显存。
+            # AMD 的 ROCm 平台在这方面统计不准，所以跳过。Nvidia CUDA 平台则进行预估。
             cudagraph_memory_estimate = 0
             if not self.model_config.enforce_eager and not current_platform.is_rocm():
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
-        # Use the pre-cudagraph torch peak to avoid double-counting.
+        # =========================================================================
+        # 阶段 4：算总账（精准的减法运算）
+        # =========================================================================
+        # 计算假推理带来的纯增量：峰值显存 - 压测前的基础显存
         profile_result.torch_peak_increase = (
             profile_torch_peak - profile_result.before_profile.torch_peak
         )
+        
+        # 算出模型运行时“雷打不动”必须占用的总显存量（Non KV Cache Memory）：
+        # = 非 Torch 框架占用的额外开销 + 刚才测出的激活值峰值增量 + 模型权重的死体积
         profile_result.non_kv_cache_memory = (
             profile_result.non_torch_increase
             + profile_result.torch_peak_increase
             + profile_result.weights_memory
         )
 
-        # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.
-        # On CUDA, respect the opt-in flag as originally designed.
+        # 是否要把 CUDA Graph 的预估开销算进账本里（基于环境变量控制）
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
@@ -475,83 +478,53 @@ class Worker(WorkerBase):
         self.peak_activation_memory = profile_result.torch_peak_increase
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
+        # =========================================================================
+        # 阶段 5：环境防污染安全校验（极其严谨的设计）
+        # =========================================================================
         free_gpu_memory = profile_result.after_profile.free_memory
-        # NOTE(woosuk): Here we assume that the other processes using the same
-        # GPU did not change their memory usage during the profiling.
-        assert self.init_snapshot.free_memory >= free_gpu_memory, (
-            "Error in memory profiling. "
-            f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
-            f"current free memory {format_gib(free_gpu_memory)} GiB. "
-            "This happens when other processes sharing the same container "
-            "release GPU memory while vLLM is profiling during initialization. "
-            "To fix this, ensure consistent GPU memory allocation or "
-            "isolate vLLM in its own container."
-        )
+        
+        # 假设前提：在 vLLM 测显存的这几秒钟里，显卡上的其他进程没有乱动显存。
+        # 如果压测完之后，发现当前显卡总剩余量，居然比压测前（init_snapshot）还要多，
+        # 说明有个其他程序在这期间释放了显存，导致我们的测量基准被污染了！直接报错阻断。
+        assert self.init_snapshot.free_memory >= free_gpu_memory, ( ... )
+
+        # 【最终得数】：
+        # 理论上留给 KV Cache 的空间 = 系统允许你用的总显存限制（比如总显存的 0.9） - 雷打不动的固定开销 - CUDA Graph 预留
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
 
+        # =========================================================================
+        # 阶段 6：详细日志与未来版本警告
+        # =========================================================================
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
-        logger.debug(
-            "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
-            format_gib(self.init_snapshot.free_memory),
-            self.cache_config.gpu_memory_utilization,
-            format_gib(self.requested_memory),
-        )
-        logger.debug(
-            "Free memory after profiling: %s GiB (total), %s GiB (within requested)",
-            format_gib(free_gpu_memory),
-            format_gib(free_gpu_memory - unrequested_memory),
-        )
+        # 打印各种 debug 级别的日志，方便开发者排查显存分配细节
+        logger.debug(...)
+        logger.debug(...)
         logger.debug(profile_result)
-        logger.info_once(
-            "Available KV cache memory: %s GiB",
-            format_gib(self.available_kv_cache_memory_bytes),
-            scope="local",
-        )
+        logger.info_once(...) # 打印最终可用的 KV Cache 容量
 
+        # 针对即将在 v0.19 版本默认开启的 CUDA Graph 显存预估功能，给出平滑过渡提示：
+        # 如果把 CUDA Graph 开销算进来，会导致留给 KV Cache 的空间变小（可能引起原来能跑的模型现在跑不了）。
+        # 所以系统会贴心地计算出一个 suggested_util（建议的显存利用率比例），
+        # 告诉你：“如果你想保持和旧版本一样的 KV 容量，请把启动参数从 0.90 提高到 0.92”。
         if cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory
             current_util = self.cache_config.gpu_memory_utilization
             cg_util_delta = cudagraph_memory_estimate / total_mem
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
+                # 已经开启该特性的提示
                 equiv_util = round(current_util - cg_util_delta, 4)
-                suggested_util = min(
-                    round(current_util + cg_util_delta, 4),
-                    1.0,
-                )
-                logger.info(
-                    "CUDA graph memory profiling is enabled "
-                    "(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1). "
-                    "This will become the default in v0.19. "
-                    "The current --gpu-memory-utilization=%.4f is equivalent "
-                    "to --gpu-memory-utilization=%.4f without CUDA graph "
-                    "memory profiling. To maintain the same effective KV "
-                    "cache size as before, increase "
-                    "--gpu-memory-utilization to %.4f.",
-                    current_util,
-                    equiv_util,
-                    suggested_util,
-                )
+                suggested_util = min(round(current_util + cg_util_delta, 4), 1.0)
+                logger.info(...)
             else:
-                suggested_util = min(
-                    round(current_util + cg_util_delta, 4),
-                    1.0,
-                )
-                logger.info(
-                    "In v0.19, CUDA graph memory profiling will be enabled "
-                    "by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), "
-                    "which more accurately accounts for CUDA graph memory "
-                    "during KV cache allocation. To try it now, set "
-                    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase "
-                    "--gpu-memory-utilization from %.4f to %.4f to maintain "
-                    "the same effective KV cache size.",
-                    current_util,
-                    suggested_util,
-                )
+                # 尚未开启该特性的警告提示
+                suggested_util = min(round(current_util + cg_util_delta, 4), 1.0)
+                logger.info(...)
 
+        # 带着最终算出的“完美余额”，交差！
         return int(self.available_kv_cache_memory_bytes)
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
@@ -584,39 +557,68 @@ class Worker(WorkerBase):
             self.model_runner.update_max_model_len(max_model_len)
         logger.debug("Updated max_model_len to %d", max_model_len)
 
+    # 分布式追踪：在性能监控大盘中记录这部分（真正划拨物理显存）的耗时
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-        """Allocate GPU KV cache with the specified kv_cache_config."""
+        """Allocate GPU KV cache with the specified kv_cache_config.
+        使用刚刚（经过 Profiling 和 Scheduler 确认过的）最终配置，正式分配物理显存。
+        """
 
+        # 【步骤 1：同步本地账本】
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
+        # 经过上一步的极限压测和 Auto-fit 裁剪，num_blocks 可能被缩小了。
+        # 这里把最终敲定的“真实 Block 数量”写回给 Worker 本地的配置中，
+        # 这样接下来的 Warmup（预热）阶段，系统才知道到底在多大的池子里游泳。
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
-        # Init kv cache connector here, because it requires
-        # `kv_cache_config`.
-        # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
-        # because `initialize_kv_cache` will inject kv cache groups not
-        # related to kv cache connector (e.g. kv cache sharing layers).
+        # 【步骤 2：KV 缓存传输（分布式分离推理）初始化】
+        # Init kv cache connector here, because it requires `kv_cache_config`.
+        # vLLM 的一个前沿特性：支持跨节点的 KV 传输（比如一台机器专门做 Prefill 算提示词，
+        # 算完把 KV Cache 传给另一台机器做 Decode 生成）。
+        # 作者留下的坑位提示：必须在真正划拨显存前初始化这个 Connector，以免后面被其他缓存组干扰。
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
+        # 【步骤 3：核心动作 —— 真正划拨物理显存池】
+        # 是否启用了“睡眠模式”（Sleep Mode，用于多租户或弹性扩缩容以节省算力成本）
         if self.vllm_config.model_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator
 
+            # 拿到 CUDA 底层内存分配器的实例
             allocator = CuMemAllocator.get_instance()
+            
+            # 💡【核心呼应】：还记得我们之前讨论的 "weights" (权重) 显存池吗？
+            # 这里它又出现了！这次打的标签是 "kv_cache"！
+            # 开启上下文管理器，这意味着接下来底层划拨的几十 GB 显存，
+            # 全部被划归到了名叫 "kv_cache" 的专属隔离区。
+            # 这样在触发“睡眠模式”时，系统可以一键清空或挂起 "kv_cache" 池，而绝对不会误伤 "weights" 里的模型参数！
             with allocator.use_memory_pool(tag="kv_cache"):
                 self.model_runner.initialize_kv_cache(kv_cache_config)
         else:
+            # 常规模式：直接在 PyTorch 默认的公共显存池里划出一大块连续内存作为 KV Cache。
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
+        # 【步骤 4：MoE 模型专属附加设置】
+        # 如果当前跑的是 MoE 模型（混合专家模型，如 Mixtral/DeepSeek），
+        # 并且用户开启了“返回专家路由信息”的开关，则在这里初始化路由捕获器。
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
 
+        # 【步骤 5：安全与隔离清理（KV Zeroing）】
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
+        
+        # 在多租户云环境中，为了防止后一个用户读取到前一个用户残留在显卡里的 Prompt 信息，
+        # 需要对废弃的 KV Cache 进行“零值清空”（KV Zeroing）。
         if kv_cache_config.needs_kv_cache_zeroing and hasattr(
             self.model_runner, "_init_kv_zero_meta"
         ):
+            # 💡【精妙的设计】：注意作者上面的英文注释。
+            # 记录哪些 Block 需要被清零的“记账元数据（Metadata）”，必须脱离刚才那个 "kv_cache" 的池子来创建！
+            # 因为如果系统进入睡眠模式，"kv_cache" 里的物理内容会被全部丢弃，
+            # 如果把记账的本子也放在那里，醒来后系统就找不到哪些内存块是干净的了。
+            # 所以这段代码写在了 with allocator 之外，强制使用标准的 PyTorch 显存分配。
             self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")

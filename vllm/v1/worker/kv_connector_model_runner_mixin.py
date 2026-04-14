@@ -198,46 +198,42 @@ class KVConnectorModelRunnerMixin:
         kernel_block_sizes: list[int],
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, type[AttentionBackend]]:
         """
-        Initializes and reshapes KV caches for the simple case where all
-        layers have the same layout.
-
-        This function assumes use_uniform_kv_cache() returned True.
-
-        Args:
-            kv_cache_config: The KV cache config
-            attn_groups: The list of attention groups for this model
-            cache_dtype: The KV cache dtype
-            device: The torch device to allocate on.
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
-        Returns:
-            A tuple (kv_caches, cross_layers_kv_cache, attn_backend) where:
-                kv_caches is a dict mapping between layer names to their
-                    corresponding memory buffer for KV cache.
-                cross_layers_kv_cache is the cross layers kv cache tensor
-                attn_backend is the attention backend matching this tensor
+        【VIP 快速通道】：专为所有层布局相同的模型（如 Llama, Qwen）设计。
+        核心动作：跳过一层层申请显存的繁琐步骤，直接向 GPU 申请一块物理连续的“通天巨无霸”张量。
         """
+        # 【步骤 1：获取模板与防呆校验】
+        # 既然大家长得都一样，直接抓取第 0 组的第 0 个算子作为全网的规格模板。
         attn_group = attn_groups[0][0]
         kv_cache_spec = attn_group.kv_cache_spec
         assert isinstance(kv_cache_spec, AttentionSpec)
 
+        # 再次严格校验：是不是所有层要求的显存大小真的完全一样？
         tensor_sizes = set(
             kv_cache_tensor.size for kv_cache_tensor in kv_cache_config.kv_cache_tensors
         )
-        assert len(tensor_sizes) == 1
-        tensor_size = tensor_sizes.pop()
+        assert len(tensor_sizes) == 1  # 如果不是唯一的，直接报错阻断
+        tensor_size = tensor_sizes.pop() # 获取单层需要的字节数
 
+        # 【步骤 2：计算全网总显存需求】
         page_size = kv_cache_spec.page_size_bytes
         assert tensor_size % page_size == 0
-        num_blocks = tensor_size // page_size
-        num_layers = len(kv_cache_config.kv_cache_tensors)
-        total_size = tensor_size * num_layers
+        num_blocks = tensor_size // page_size # 单层包含的逻辑 Block 数量
+        num_layers = len(kv_cache_config.kv_cache_tensors) # 模型总层数（如 32 层）
+        
+        # 💡 算出总建筑面积 = 单层面积 * 总层数
+        total_size = tensor_size * num_layers 
 
+        # 【步骤 3：逻辑 Block 向物理 Kernel Block 转换】
         assert len(kernel_block_sizes) == 1
         kernel_block_size = kernel_block_sizes[0]
+        # 把调度器的大 Block 切成底层算子需要的小 Block（如 256 切成 4 个 64）
         num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
         kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
+        # 【步骤 4：向底层算子询问“最佳张量形状”】
         attn_backend = attn_group.backend
+        # 不同的 CUDA 算子（FlashAttention/XFormers）对显存排布有不同的偏好。
+        # 这里向底层索要它最喜欢的 4D 形状，比如：[num_blocks, num_heads, head_size, block_size]
         kv_cache_shape = attn_backend.get_kv_cache_shape(
             kernel_num_blocks,
             kernel_block_size,
@@ -246,37 +242,54 @@ class KVConnectorModelRunnerMixin:
             cache_dtype_str=cache_dtype,
         )
 
-        # prepend a num_layers dimension into the shape
+        # 把“层数（num_layers）”作为最高维度加进去，变成 5D 形状。
+        # 此时形状类似：[32层, 1000块, 32头, 128维度, 64块大小]
         kv_cache_shape = (num_layers,) + kv_cache_shape
 
+        # 【步骤 5：核心黑科技！内存交织优化 (Stride Order)】
         try:
+            # 询问底层算子：你希望内存的物理先后顺序怎么排？
             kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(
                 include_num_layers_dimension=True
             )
             assert len(kv_cache_stride_order) == len(kv_cache_shape)
         except (AttributeError, NotImplementedError):
+            # 如果算子没要求，就按标准顺序 (0, 1, 2, 3, 4)
             kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
 
+        # 根据算子要求的物理顺序，把原本的形状“洗牌（打乱维度顺序）”
         kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
 
         logger.info("Allocating a cross layer KV cache of shape %s", kv_cache_shape)
 
+        # 【步骤 6：真正向显卡要内存（暴力开辟一维连续显存）】
         # allocate one contiguous buffer for all layers
+        # 极其粗暴且优雅：先要一块纯粹的 1 维连续字节数组 (torch.int8)，
+        # 然后强行转换数据类型 (view dtype)，最后强行折叠成洗牌后的多维形状 (view shape)。
         cross_layers_kv_cache = (
             torch.zeros(total_size, dtype=torch.int8, device=device)
             .view(kv_cache_spec.dtype)
             .view(kv_cache_shape)
         )
 
+        # 【步骤 7：恢复人类/上层的逻辑视角】
         # Maintain original KV shape view.
+        # 虽然物理上内存已经被洗牌交织了，但上层的 Python 代码如果不按顺序读写会疯掉的。
+        # 所以算出逆向序列 (inv_order)，用 permute() 生成一个“逻辑上正常”的视图。
         inv_order = [
             kv_cache_stride_order.index(i) for i in range(len(kv_cache_stride_order))
         ]
+        # permute 不会移动任何物理显存！它只是修改了张量内部的步长（Stride）元数据。
         permuted_kv_cache = cross_layers_kv_cache.permute(*inv_order)
 
+        # 【步骤 8：切蛋糕与交房】
         kv_caches = {}
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            # 沿着第 0 维（num_layers）切片。
+            # 比如 tensor = permuted_kv_cache[0] 就是第 0 层专属的几十 GB 显存指针。
             tensor = permuted_kv_cache[i]
+            
+            # 把切好的片，挂载到具体的层名字上（如 layer_0）
             for layer_name in kv_cache_tensor.shared_by:
                 kv_caches[layer_name] = tensor
 

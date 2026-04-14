@@ -376,34 +376,59 @@ class DefaultModelLoader(BaseModelLoader):
                 num_experts,
             )
 
-    @instrument(span_name="Load weights")
+    @instrument(span_name="Load weights") # 分布式追踪：记录纯权重加载阶段的耗时
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        """
+        将磁盘上的权重正式注入到初始化好的 nn.Module 模型中。
+        """
+        
+        # --- 1. TorchAO 量化框架的特殊处理 ---
+        # TorchAO 是 PyTorch 官方推出的底层量化库。
         if model_config.quantization == "torchao":
             quant_config = get_quant_config(model_config, self.load_config)
+            # 如果是 TorchAO 序列化后的检查点，且版本支持，则切换加载策略
             if (
                 hasattr(quant_config, "is_checkpoint_torchao_serialized")
                 and quant_config.is_checkpoint_torchao_serialized
                 and torchao_version_at_least("0.15.0")
             ):
+                # 告知加载器：使用 TorchAO 专有的 Safetensors 加载逻辑，
+                # 它可以处理复杂的量化权重排布（Layout）。
                 self.load_config.safetensors_load_strategy = "torchao"
 
+        # --- 2. 专家并行（EP）权重过滤器初始化 ---
+        # 【核心优化点】在多卡推理 MoE 模型（如 Mixtral/DeepSeek）时非常关键。
+        # 根据当前卡的 Rank，确定它只负责加载哪些专家。
+        # 这避免了每张卡都加载全部专家权重再丢弃，极大节省显存和总线带宽。
         self._init_ep_weight_filter(model_config)
 
+        # --- 3. 权重加载与注入（最重体力活） ---
+        # weights_to_load: 记录模型中所有参数的名字，用于后续完整性校验
         weights_to_load = {name for name, _ in model.named_parameters()}
+        
+        # 调用 get_all_weights()：这是一个迭代器/生成器，
+        # 它会扫描磁盘文件（Safetensors/Bin），逐个产出 (weight_name, tensor)。
+        # 然后传给 model.load_weights()，模型内部会将这些张量 copy_() 到对应的显存位置。
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
+        # --- 4. 性能记录 ---
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
             scope="local",
         )
-        # We only enable strict check for non-quantized models
-        # that have loaded weights tracking currently.
+
+        # --- 5. 严格完整性校验 (The Strict Check) ---
+        # 我们只对非量化模型（量化模型层名可能改变）且具备追踪能力的加载进行校验。
         if model_config.quantization is None and loaded_weights is not None:
+            # 找出那些“应该被加载但实际没加载到”的权重
             weights_not_loaded = weights_to_load - loaded_weights
+            
+            # 如果集合不为空，说明模型中有些层没被填上数据（通常是权重文件缺失或层名对不上）
             if weights_not_loaded:
+                # 直接抛错，防止模型以未初始化的随机权重运行，产生乱码输出
                 raise ValueError(
-                    "Following weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
+                    "以下权重未能从检查点中初始化: "
+                    f"{weights_not_loaded}"
                 )

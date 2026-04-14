@@ -32,32 +32,63 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 logger = init_logger(__name__)
 
 
-@instrument(span_name="Initialize model")
+@instrument(span_name="Initialize model") # 分布式追踪：记录这整个函数执行（也就是模型初始化阶段）所花费的时间
 def initialize_model(
-    vllm_config: VllmConfig,
+    vllm_config: VllmConfig, # vLLM 全局配置大对象，包含模型配置、缓存配置、并行配置等
     *,
-    prefix: str = "",
-    model_class: type[nn.Module] | None = None,
-    model_config: ModelConfig | None = None,
+    prefix: str = "", # 模块名称前缀，通常在处理多模态或复杂嵌套模型时，用来区分不同子模块的参数名
+    model_class: type[nn.Module] | None = None, # 目标模型的 PyTorch 类（比如 LlamaForCausalLM）。如果不传，会去 config 里猜
+    model_config: ModelConfig | None = None, # 专门关于模型结构（层数、维度等）的配置对象
 ) -> nn.Module:
-    """Initialize a model with the given configurations."""
+    """Initialize a model with the given configurations.
+    使用给定的配置来实例化模型的“骨架”（注意：这里通常只是建立网络结构，还没有加载权重数据）
+    """
+    
+    # --- 1. 配置预处理与模型架构推断 ---
+    
+    # 如果没传具体的模型配置，就从全局的 vllm_config 里拿默认的
     if model_config is None:
         model_config = vllm_config.model_config
+        
+    # 如果没传该用哪个 PyTorch 类来建模型，就去查字典。
+    # get_model_architecture 会读取 config.json 里的 "architectures" 字段（如 ["LlamaForCausalLM"]），
+    # 然后在 vLLM 自己注册的模型库里找到对应的实际 Python 类。
     if model_class is None:
         model_class, _ = get_model_architecture(model_config)
 
+    # --- 2. 量化配置预处理 ---
+    # 如果开启了量化（比如 AWQ, GPTQ 等），提前设置一下。
+    # 这步很重要，因为量化模型的某些层（比如 Linear）会被替换成专门的量化算子类（比如 QLinear）。
     if vllm_config.quant_config is not None:
         configure_quant_config(vllm_config.quant_config, model_class)
 
+    # --- 3. 探查类的构造函数（区分新老 API） ---
+    
+    # 使用 Python 内置的 inspect 模块，获取刚刚找到的那个 model_class 类的 __init__ 方法长什么样
     signatures = inspect.signature(model_class.__init__)
+    # 提取它需要接收的所有参数名字（是个列表）
     all_params = [param.name for param in signatures.parameters.values()]
+    
+    # --- 4. 新版 vLLM 模型类的初始化路径 ---
+    
+    # vLLM 的最新规范是：所有模型类都应该统一只接收 vllm_config 和 prefix 两个核心参数。
     if "vllm_config" in all_params and "prefix" in all_params:
         # new-style model class
+        # 建立一个上下文，把当前的 vllm_config 设为全局线程可见，方便底层算子随时取用。
         with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
+            # 实例化大模型（也就是搭起那些空壳参数层）
             model = model_class(vllm_config=vllm_config, prefix=prefix)
+            # 记录一些元数据，主要是为了以后在不重启进程的情况下，支持动态重载模型（比如热切换不同的 LoRA 或权重）。
             record_metadata_for_reloading(model)
+            # 成功返回搭好的骨架
             return model
 
+    # --- 5. 兼容老版（第三方）模型类的回退路径 ---
+    
+    # 如果执行到了这里，说明刚才那个 if 没进去，也就是找到的类，它的 __init__ 参数不符合新规范。
+    # 这通常是因为用户自己写了一个老版本的模型实现，并且强行注册进了 vLLM。
+    
+    # 打印黄色的弃用警告，提醒开发者赶紧改代码，符合最新的设计规范。
     msg = (
         "vLLM model class should accept `vllm_config` and `prefix` as "
         "input arguments. Possibly you have an old-style model class"
@@ -71,11 +102,15 @@ def initialize_model(
         "Trying to guess the arguments for old-style model class %s",
         model_class,
     )
+    
     # try to be compatible with old-style model class
+    # 既然是老类，我们就来“猜”它需要什么参数。准备一个空字典。
     kwargs: dict[str, Any] = {}
+    
+    # 老版本的类，通常是要啥传啥。我们看看它的 __init__ 签名里有哪些名字，有的就强行塞进去。
     if "prefix" in all_params:
         kwargs["prefix"] = prefix
-    if "config" in all_params:
+    if "config" in all_params: # 这里注意，老代码可能直接要 HuggingFace 的 config 对象
         kwargs["config"] = model_config.hf_config
     if "cache_config" in all_params:
         kwargs["cache_config"] = vllm_config.cache_config
@@ -85,7 +120,10 @@ def initialize_model(
         kwargs["lora_config"] = vllm_config.lora_config
     if "scheduler_config" in all_params:
         kwargs["scheduler_config"] = vllm_config.scheduler_config
+        
+    # 参数猜完并打包好之后，依然开启上下文
     with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
+        # 把字典拆包(**kwargs)，扔给这个老版本类去初始化
         model = model_class(**kwargs)
         record_metadata_for_reloading(model)
 
@@ -208,20 +246,42 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
 
 
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
+    """
+    获取模型架构类（如 LlamaForCausalLM）和架构名称。
+    这是一个带缓存的“前端”代理函数，利用哈希值来加速查询。
+    """
+    
+    # --- 第一步：生成“指纹”（哈希值） ---
+    # 把能够唯一决定一个模型架构的所有关键属性打包在一起，生成一个独一无二的 Hash 键值。
     key = hash(
         (
-            model_config.model,
-            model_config.convert_type,
-            model_config.runner_type,
-            model_config.trust_remote_code,
-            model_config.model_impl,
+            model_config.model,               # 模型的路径或名字 (例如: "meta-llama/Llama-2-7b")
+            model_config.convert_type,        # 权重转换类型（是否需要特定的格式转换）
+            model_config.runner_type,         # 运行器类型（是生成模型、池化模型还是多模态模型等）
+            model_config.trust_remote_code,   # 安全标识（是否允许执行 HuggingFace 上的自定义 Python 代码）
+            model_config.model_impl,          # 内部实现标记（vLLM 可能有同一模型的多种底层实现）
+            
+            # 从 config.json 中提取的架构列表（如 ["LlamaForCausalLM"]）。
+            # 【关键细节】：因为 Python 中的列表（List）是可变的，无法被 hash()，
+            # 所以必须强制转换成不可变的元组（Tuple）才能作为字典的 Key。
             tuple(getattr(model_config.hf_config, "architectures", [])),
         )
     )
+    
+    # --- 第二步：查缓存（拦截重复劳动） ---
+    # _MODEL_ARCH_BY_HASH 是一个全局字典。
+    # 如果这个“指纹”之前已经来过，直接从字典里拿出结果返回，瞬间完成。
     if key in _MODEL_ARCH_BY_HASH:
         return _MODEL_ARCH_BY_HASH[key]
 
+    # --- 第三步：干苦力活（缓存未命中） ---
+    # 如果是第一次见到这个“指纹”，就去调用那个带下划线的真正的底层函数。
+    # _get_model_architecture 内部包含非常复杂的逻辑：它要去读取文件、解析 JSON、
+    # 遍历 vLLM 庞大的已注册模型注册表（Registry），寻找匹配的类。这个过程相对耗时。
     model_arch = _get_model_architecture(model_config)
+    
+    # --- 第四步：记录结果并返回 ---
+    # 拿到结果后，把它存到全局字典里。下次同样的配置再来要架构类，就不用再执行第三步了。
     _MODEL_ARCH_BY_HASH[key] = model_arch
     return model_arch
 

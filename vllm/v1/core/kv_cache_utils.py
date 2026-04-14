@@ -1262,25 +1262,54 @@ def get_kv_cache_groups(
     return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
 
 
+
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration for the scheduler.
+    【核心目的】：为中央调度器（Scheduler）生成一份统一的 KV Cache 配置。
+    调度器不需要知道底层每一张卡、每一层网络的具体参数名字，它只需要知道：
+    “全网总共有多少个 Block 可以分配？” 以及 “每个 Block 长什么样？”
     """
+    
+    # 【第一步：绝对同步校验 (Sanity Check)】
+    # 这里呼应了我们之前讲的 All-Reduce(MIN) 逻辑。
+    # 既然所有的 Worker 刚才都已经通过网络达成共识了，那么它们上报上来的
+    # kv_cache_configs 列表中，每一个 Worker 算出的 num_blocks 必须完全相等！
+    # 如果不一样，说明系统状态撕裂了，直接断言报错。
     assert all(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
     )
+    
+    # 【第二步：抽取代表 (Representative Sampling)】
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
+    # 既然大家能切出来的 Block 数量一样，Block 的维度大小也一样（除了负责的层名字不同），
+    # 调度器就不需要看所有人的报告了。
+    # 直接深拷贝（deepcopy）第 0 号 Worker 的配置，作为全网的通用模板。
     cfg = copy.deepcopy(kv_cache_configs[0])
+    
+    # 【第三步：抹除底层细节，高度抽象化】
+    # 遍历这份模板配置中的所有缓存组
     for group in cfg.kv_cache_groups:
+        
+        # vLLM 支持混合模型结构，但绝大多数标准大模型（如 Llama, Qwen）
+        # 它们的每一层 Attention 结构都是完全一样的（UniformTypeKVCacheSpecs）。
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
             # so use an arbitrary one to initialize the scheduler.
+            
+            # 【抹除层级名字】：
+            # 在底层，配置表里可能详细记录着 {"layer_0": spec, "layer_1": spec, ...}。
+            # 但调度器根本不关心你是第几层。它只管发放 Token 的逻辑槽位。
+            # 所以，这里用 next(iter(...)) 直接随便抓取字典里的第一个 spec。
+            # 把原来复杂的字典，替换成了单一的泛型规格。
             group.kv_cache_spec = next(
                 iter(group.kv_cache_spec.kv_cache_specs.values())
             )
+            
+    # 将这份高度精简、去除了层级细节的“宏观配置表”，正式交给调度器
     return cfg
 
 

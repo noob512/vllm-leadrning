@@ -156,14 +156,35 @@ class Executor(ABC):
         """
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
+        【核心目的】：根据最终敲定的 KV Cache 方案，在显卡上真正划出内存池，并对模型进行预热/编译。
         """
+        
+        # 【动作 1：正式划拨 KV Cache 物理显存】
+        # 包工头（Master）再次拿起大喇叭，把刚才 scheduler 确认过、大家达成共识的
+        # kv_cache_configs（配置清单）发给所有的工人（Workers）。
+        # 工人们收到后，会真正在底层的 C++/CUDA 层调用内存分配指令，
+        # 把那块巨大的连续显存切成一个个物理 Block，彻底霸占下来。
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
+        
+        # 【动作 2：引擎点火与预热（耗时最长的一步）】
+        # 包工头发令：“跑道建好了，大家开着跑车去热热身！”
+        # 这一步极其关键。工人们会在自己的显卡上执行预热或编译：
+        # 1. CUDA Graph 捕获：用不同的 Batch Size 空跑模型，把执行路径“刻录”在显卡硬件上。
+        # 2. torch.compile（如果开启）：在这里进行 JIT 实时编译，把 Python 代码变成极致优化的底层机器码。
+        # 每个工人跑完后，会把自己的“预热/编译耗时”以浮点数形式返回。
         compilation_times: list[float] = self.collective_rpc("compile_or_warm_up_model")
+        
+        # 【动作 3：时间统计与同步】
         # Propagate compilation time from workers back to the main process.
         # With TP>1, compilation happens in worker processes, so the main
         # process config is never updated. Use max across workers since they
         # compile in parallel.
+        
+        # 如果开启了多卡张量并行（TP > 1），编译和预热是几张显卡同时、并行在跑的。
+        # 既然是并行，那整个系统的启动时间，就取决于“跑得最慢的那张卡”（再次体现木桶效应）。
         if compilation_times:
+            # 取所有 Worker 耗时的最大值 (max)，记录到全局配置中。
+            # 这个数据通常用于系统监控、日志打印或者性能分析。
             self.vllm_config.compilation_config.compilation_time = max(
                 compilation_times
             )
